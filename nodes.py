@@ -6,16 +6,6 @@ import numpy as np
 import math
 from tqdm import tqdm
 
-from .wanvideo.modules.clip import CLIPModel
-from .wanvideo.modules.model import WanModel, rope_params
-from .wanvideo.modules.t5 import T5EncoderModel
-from .wanvideo.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
-                               get_sampling_sigmas, retrieve_timesteps)
-from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
-from accelerate import init_empty_weights
-from accelerate.utils import set_module_tensor_to_device
-
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, save_torch_file, ProgressBar
@@ -155,6 +145,9 @@ class WanVideoModelLoader:
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
                   compile_args=None, attention_mode="sdpa", block_swap_args=None):
+        from .wanvideo.modules.model import WanModel
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
         transformer = None
         mm.unload_all_models()
         mm.soft_empty_cache()
@@ -445,6 +438,7 @@ class LoadWanVideoT5TextEncoder:
     DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/LLM'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device"):
+        from .wanvideo.modules.t5 import T5EncoderModel
        
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -490,6 +484,7 @@ class LoadWanVideoClipTextEncoder:
     DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/LLM'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device"):
+        from .wanvideo.modules.clip import CLIPModel
        
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -713,6 +708,9 @@ class WanVideoSampler:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, force_offload=True, samples=None, denoise_strength=1.0):
+        from .wanvideo.modules.model import rope_params
+        from .wanvideo.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+        from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
         patcher = model
         model = model.model
         transformer = model.diffusion_model
