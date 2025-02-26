@@ -15,8 +15,11 @@ except ModuleNotFoundError:
 
 try:
     from sageattention import sageattn
+    @torch.compiler.disable()
+    def sageattn_func(q, k, v, attn_mask=None, dropout_p=0, is_causal=False):
+        return sageattn(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
 except ModuleNotFoundError:
-    sageattn = None
+    sageattn_func = None
 import warnings
 
 __all__ = [
@@ -148,11 +151,12 @@ def attention(
     deterministic=False,
     dtype=torch.bfloat16,
     attention_mode='sdpa',
-):
-    if attention_mode == 'flash_attention_2':
-        fa_version = 2
-    elif attention_mode == 'flash_attention_3':
-        fa_version = 3
+):  
+    if "flash" in attention_mode:
+        if attention_mode == 'flash_attn_2':
+            fa_version = 2
+        elif attention_mode == 'flash_attn_3':
+            fa_version = 3
         return flash_attention(
             q=q,
             k=k,
@@ -191,7 +195,7 @@ def attention(
         k = k.transpose(1, 2).to(dtype)
         v = v.transpose(1, 2).to(dtype)
 
-        out = sageattn(
+        out = sageattn_func(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
         out = out.transpose(1, 2).contiguous()

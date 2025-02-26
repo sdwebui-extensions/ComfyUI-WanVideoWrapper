@@ -20,6 +20,8 @@ __all__ = [
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
+import comfy.model_management as mm
+
 def pos_interpolate(pos, seq_len):
     if pos.size(1) == seq_len:
         return pos
@@ -391,17 +393,17 @@ class XLMRobertaCLIP(nn.Module):
             proj_dropout=proj_dropout,
             embedding_dropout=embedding_dropout,
             norm_eps=norm_eps)
-        self.textual = XLMRobertaWithHead(
-            vocab_size=vocab_size,
-            max_seq_len=max_text_len,
-            type_size=type_size,
-            pad_id=pad_id,
-            dim=text_dim,
-            out_dim=embed_dim,
-            num_heads=text_heads,
-            num_layers=text_layers,
-            post_norm=text_post_norm,
-            dropout=text_dropout)
+        # self.textual = XLMRobertaWithHead(
+        #     vocab_size=vocab_size,
+        #     max_seq_len=max_text_len,
+        #     type_size=type_size,
+        #     pad_id=pad_id,
+        #     dim=text_dim,
+        #     out_dim=embed_dim,
+        #     num_heads=text_heads,
+        #     num_layers=text_layers,
+        #     post_norm=text_post_norm,
+        #     dropout=text_dropout)
         self.log_scale = nn.Parameter(math.log(1 / 0.07) * torch.ones([]))
 
     def forward(self, imgs, txt_ids):
@@ -529,6 +531,6 @@ class CLIPModel:
 
     def visual(self, image):
         # forward
-        with torch.cuda.amp.autocast(dtype=self.dtype):
+        with torch.autocast(device_type=mm.get_autocast_device(self.device), dtype=self.dtype):
             out = self.model.visual(image, use_31_block=True)
             return out
