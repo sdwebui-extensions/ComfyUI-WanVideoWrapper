@@ -242,11 +242,11 @@ class WanVideoModelLoader:
         mm.unload_all_models()
         mm.soft_empty_cache()
         manual_offloading = True
-        if "sage" in attention_mode:
-            try:
-                from sageattention import sageattn
-            except Exception as e:
-                raise ValueError(f"Can't import SageAttention: {str(e)}")
+        # if "sage" in attention_mode:
+        #     try:
+        #         from sageattention import sageattn
+        #     except Exception as e:
+        #         raise ValueError(f"Can't import SageAttention: {str(e)}")
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
