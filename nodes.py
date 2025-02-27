@@ -8,20 +8,15 @@ from tqdm import tqdm
 
 import folder_paths
 import comfy.model_management as mm
-from comfy.utils import load_torch_file, save_torch_file, ProgressBar
+from comfy.utils import load_torch_file, save_torch_file, ProgressBar, common_upscale
 import comfy.model_base
 import comfy.latent_formats
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 def add_noise_to_reference_video(image, ratio=None):
-    if ratio is None:
-        sigma = torch.normal(mean=-3.0, std=0.5, size=(image.shape[0],)).to(image.device)
-        sigma = torch.exp(sigma).to(image.dtype)
-    else:
-        sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio
-    
-    image_noise = torch.randn_like(image) * sigma[:, None, None, None, None]
+    sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio 
+    image_noise = torch.randn_like(image) * sigma[:, None, None, None]
     image_noise = torch.where(image==-1, torch.zeros_like(image), image_noise)
     image = image + image_noise
     return image
@@ -117,7 +112,7 @@ def filter_state_dict_by_blocks(state_dict, blocks_mapping):
     filtered_dict = {}
 
     for key in state_dict:
-        if 'double_blocks.' in key or 'single_blocks.' in key:
+        if 'blocks.' in key:
             block_pattern = key.split('diffusion_model.')[1].split('.', 2)[0:2]
             block_key = f'{block_pattern[0]}.{block_pattern[1]}.'
 
@@ -180,6 +175,31 @@ class WanVideoLoraSelect:
         loras_list.append(lora)
         return (loras_list,)
 
+class WanVideoLoraBlockEdit:
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        arg_dict = {}
+        argument = ("BOOLEAN", {"default": True})
+
+        for i in range(40):
+            arg_dict["blocks.{}.".format(i)] = argument
+
+        return {"required": arg_dict}
+
+    RETURN_TYPES = ("SELECTEDBLOCKS", )
+    RETURN_NAMES = ("blocks", )
+    OUTPUT_TOOLTIPS = ("The modified lora model",)
+    FUNCTION = "select"
+
+    CATEGORY = "WanVideoWrapper"
+
+    def select(self, **kwargs):
+        selected_blocks = {k: v for k, v in kwargs.items() if v is True and isinstance(v, bool)}
+        print("Selected blocks LoRA: ", selected_blocks)
+        return (selected_blocks,)
 
 #region Model loading
 class WanVideoModelLoader:
@@ -633,10 +653,14 @@ class WanVideoImageClipEncode:
             "vae": ("WANVAE",),
             "generation_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
             "generation_height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
-            "num_frames": ("INT", {"default": 81, "min": 5, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
             },
             "optional": {
                 "force_offload": ("BOOLEAN", {"default": True}),
+                "noise_aug_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of noise augmentation, helpful for I2V where some noise can add motion and give sharper results"}),
+                "latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
+                "clip_embed_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}),
+
             }
         }
 
@@ -645,7 +669,7 @@ class WanVideoImageClipEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, clip, vae, image, num_frames, generation_width, generation_height, force_offload=True):
+    def process(self, clip, vae, image, num_frames, generation_width, generation_height, force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -662,6 +686,10 @@ class WanVideoImageClipEncode:
         pixel_values = clip_preprocess(image.to(device), size=224, mean=self.image_mean, std=self.image_std, crop=True).float()
         clip.model.to(device)
         clip_context = clip.visual(pixel_values)
+
+        if clip_embed_strength != 1.0:
+            clip_context *= clip_embed_strength
+        
         if force_offload:
             clip.model.to(offload_device)
             mm.soft_empty_cache()
@@ -676,33 +704,51 @@ class WanVideoImageClipEncode:
         h = lat_h * vae_stride[1]
         w = lat_w * vae_stride[2]
 
-        msk = torch.ones(1, num_frames, lat_h, lat_w, device=device)
-        msk[:, 1:] = 0
-        msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        # Step 1: Create initial mask with ones for first frame, zeros for others
+        mask = torch.ones(1, num_frames, lat_h, lat_w, device=device)
+        mask[:, 1:] = 0
 
-        max_seq_len = ((num_frames - 1) // vae_stride[0] + 1) * lat_h * lat_w // (
-            patch_size[1] * patch_size[2])
-        max_seq_len = int(math.ceil(max_seq_len / sp_size)) * sp_size
+        # Step 2: Repeat first frame 4 times and concatenate with remaining frames
+        first_frame_repeated = torch.repeat_interleave(mask[:, 0:1], repeats=4, dim=1)
+        mask = torch.concat([first_frame_repeated, mask[:, 1:]], dim=1)
+
+        # Step 3: Reshape mask into groups of 4 frames
+        mask = mask.view(1, mask.shape[1] // 4, 4, lat_h, lat_w)
+
+        # Step 4: Transpose dimensions and select first batch
+        mask = mask.transpose(1, 2)[0]
+
+        # Calculate maximum sequence length
+        frames_per_stride = (num_frames - 1) // vae_stride[0] + 1
+        patches_per_frame = lat_h * lat_w // (patch_size[1] * patch_size[2])
+        raw_seq_len = frames_per_stride * patches_per_frame
+
+        # Round up to nearest multiple of sp_size
+        max_seq_len = int(math.ceil(raw_seq_len / sp_size)) * sp_size
 
         vae.to(device)
 
-        image = image.to(device = device, dtype = vae.dtype) * 2 - 1
+        # Step 1: Resize and rearrange the input image dimensions
+        #resized_image = image.permute(0, 3, 1, 2)  # Rearrange dimensions to (B, C, H, W)
+        #resized_image = torch.nn.functional.interpolate(resized_image, size=(h, w), mode='bicubic')
+        resized_image = common_upscale(image.movedim(-1, 1), w, h, "lanczos", "disabled")
+        resized_image = resized_image.transpose(0, 1)  # Transpose to match required format
+        resized_image = resized_image * 2 - 1
 
-        y = vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    image.permute(0, 3, 1, 2), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, num_frames-1, h, w, device=device)
-            ],
-                         dim=1).to(image)
-        ],device)[0]
-        y = torch.concat([msk, y])
+        if noise_aug_strength > 0.0:
+            resized_image = add_noise_to_reference_video(resized_image, ratio=noise_aug_strength)
+        
+        # Step 2: Create zero padding frames
+        zero_frames = torch.zeros(3, num_frames-1, h, w, device=device)
+
+        # Step 3: Concatenate image with zero frames
+        concatenated = torch.concat([resized_image.to(device), zero_frames, resized_image.to(device)], dim=1).to(device = device, dtype = vae.dtype)
+        concatenated *= latent_strength
+        y = vae.encode([concatenated], device)[0]
+
+        y = torch.concat([mask, y])
+
+        vae.model.clear_cache()
         vae.to(offload_device)
 
         image_embeds = {
@@ -722,7 +768,7 @@ class WanVideoEmptyEmbeds:
         return {"required": {
             "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
             "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
-            "num_frames": ("INT", {"default": 81, "min": 5, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
             },
         }
 
@@ -835,7 +881,7 @@ class WanVideoSampler:
             lat_h = image_embeds.get("lat_h", None)
             lat_w = image_embeds.get("lat_w", None)
             if lat_h is None or lat_w is None:
-                raise ValueError("Clip encoded image embeds must be provided for i2v model")
+                raise ValueError("Clip encoded image embeds must be provided for I2V (Image to Video) model")
             noise = torch.randn(
                 16,
                 (image_embeds["num_frames"] - 1) // 4 + 1,
@@ -846,7 +892,9 @@ class WanVideoSampler:
                 device=torch.device("cpu"))
             seq_len = image_embeds["max_seq_len"]
         else: #t2v
-            target_shape = image_embeds["target_shape"]
+            target_shape = image_embeds.get("target_shape", None)
+            if target_shape is None:
+                raise ValueError("Empty image embeds must be provided for T2V (Text to Video")
             seq_len = image_embeds["max_seq_len"]
             noise = torch.randn(
                     target_shape[0],
@@ -1005,6 +1053,8 @@ class WanVideoDecode:
         print(image.shape)
         print(image.min(), image.max())
         vae.to(offload_device)
+        vae.model.clear_cache()
+        mm.soft_empty_cache()
 
         image = (image - image.min()) / (image.max() - image.min())
         image = torch.clamp(image, 0.0, 1.0)
@@ -1047,12 +1097,13 @@ class WanVideoEncode:
         if noise_aug_strength > 0.0:
             image = add_noise_to_reference_video(image, ratio=noise_aug_strength)
         
-        latents = vae.encode(image, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))#.latent_dist.sample(generator)
+        latents = vae.encode(image, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))
         if latent_strength != 1.0:
             latents *= latent_strength
-        #latents = latents * vae.config.scaling_factor
 
         vae.to(offload_device)
+        vae.model.clear_cache()
+        mm.soft_empty_cache()
         print("encoded latents shape",latents.shape)
 
 
@@ -1152,6 +1203,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoLatentPreview": WanVideoLatentPreview,
     "WanVideoEmptyEmbeds": WanVideoEmptyEmbeds,
     "WanVideoLoraSelect": WanVideoLoraSelect,
+    "WanVideoLoraBlockEdit": WanVideoLoraBlockEdit,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -1169,4 +1221,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoLatentPreview": "WanVideo Latent Preview",
     "WanVideoEmptyEmbeds": "WanVideo Empty Embeds",
     "WanVideoLoraSelect": "WanVideo Lora Select",
+    "WanVideoLoraBlockEdit": "WanVideo Lora Block Edit",
     }
