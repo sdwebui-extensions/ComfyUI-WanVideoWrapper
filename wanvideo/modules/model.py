@@ -14,8 +14,9 @@ import numpy as np
 __all__ = ['WanModel']
 
 from tqdm import tqdm
-
-from ...utils import log
+import gc
+import comfy.model_management as mm
+from ...utils import log, get_module_memory_mb
 
 def poly1d(coefficients, x):
     result = torch.zeros_like(x)
@@ -36,18 +37,18 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-def rope_params(max_seq_len, dim, theta=10000, L_test=81, k=0):
+def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
     assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+    exponents = torch.arange(0, dim, 2, dtype=torch.float64).div(dim)
+    inv_theta_pow = 1.0 / torch.pow(theta, exponents)
+    
     if k > 0:
         print(f"RifleX: Using {k}th freq")
-        freqs[k-1] = 0.9 * 2 * torch.pi / L_test
+        inv_theta_pow[k-1] = 0.9 * 2 * torch.pi / L_test
+        
+    freqs = torch.outer(torch.arange(max_seq_len), inv_theta_pow)
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
-
 
 from comfy.model_management import get_torch_device, get_autocast_device
 @torch.autocast(device_type=get_autocast_device(get_torch_device()), enabled=False)
@@ -340,7 +341,7 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        e = (self.modulation.to(torch.float32) + e.to(torch.float32)).chunk(6, dim=1)
+        e = (self.modulation.to(torch.float32).to(e.device) + e.to(torch.float32)).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # self-attention
@@ -385,7 +386,7 @@ class Head(nn.Module):
         """
         assert e.dtype == torch.float32
         e_unsqueezed = e.unsqueeze(1).to(torch.float32)
-        e = (self.modulation.to(torch.float32) + e_unsqueezed).chunk(2, dim=1)
+        e = (self.modulation.to(torch.float32).to(e.device) + e_unsqueezed).chunk(2, dim=1)
         normed = self.norm(x).to(torch.float32)
         x = self.head(normed * (1 + e[1].to(torch.float32)) + e[0].to(torch.float32))
         return x
@@ -504,6 +505,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.teacache_counter = 0
         self.rel_l1_thresh = 0.15
         self.teacache_start_step= 2
+        self.teacache_cache_device = main_device
         # self.l1_history_x = []
         # self.l1_history_temb = []
         # self.l1_history_rescaled = []
@@ -546,12 +548,30 @@ class WanModel(ModelMixin, ConfigMixin):
         self.blocks_to_swap = blocks_to_swap
         self.offload_img_emb = offload_img_emb
         self.offload_txt_emb = offload_txt_emb
+
+        total_offload_memory = 0
+        total_main_memory = 0
        
         for b, block in tqdm(enumerate(self.blocks), total=len(self.blocks), desc="Initializing block swap"):
+            block_memory = get_module_memory_mb(block)
+            
             if b > self.blocks_to_swap:
                 block.to(self.main_device)
+                total_main_memory += block_memory
             else:
                 block.to(self.offload_device)
+                total_offload_memory += block_memory
+
+        mm.soft_empty_cache()
+        gc.collect()
+                
+            #print(f"Block {b}: {block_memory:.2f}MB on {block.parameters().__next__().device}")
+        log.info("----------------------")
+        log.info(f"Block swap memory summary:")
+        log.info(f"Transformer blocks on {self.offload_device}: {total_offload_memory:.2f}MB")
+        log.info(f"Transformer blocks on {self.main_device}: {total_main_memory:.2f}MB")
+        log.info(f"Total memory used by transformer blocks: {(total_offload_memory + total_main_memory):.2f}MB")
+        log.info("----------------------")
 
     def forward(
         self,
@@ -593,8 +613,8 @@ class WanModel(ModelMixin, ConfigMixin):
         #device = self.patch_embedding.weight.device
         if freqs.device != device:
             freqs = freqs.to(device)
-        
-        if y is not None:
+            
+        if y:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
@@ -672,13 +692,13 @@ class WanModel(ModelMixin, ConfigMixin):
             if is_uncond:
                 self.previous_modulated_input_uncond = e0.clone()
                 if not should_calc:
-                    x += self.previous_residual_uncond
+                    x += self.previous_residual_uncond.to(x.device)
                     #log.info(f"TeaCache: Skipping uncond step {current_step+1}")
                     self.teacache_skipped_cond_steps += 1
             else:
                 self.previous_modulated_input_cond = e0.clone()
                 if not should_calc:
-                    x += self.previous_residual_cond
+                    x += self.previous_residual_cond.to(x.device)
                     #log.info(f"TeaCache: Skipping cond step {current_step+1}")
                     self.teacache_skipped_uncond_steps += 1
 
@@ -703,9 +723,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
             if self.enable_teacache:
                 if is_uncond:
-                    self.previous_residual_uncond = x - ori_hidden_states
+                    self.previous_residual_uncond = (x - ori_hidden_states).to(self.teacache_cache_device)
                 else:
-                    self.previous_residual_cond = x - ori_hidden_states
+                    self.previous_residual_cond = (x - ori_hidden_states).to(self.teacache_cache_device)
 
                 # if current_step > 0:
                 #   import matplotlib.pyplot as plt
