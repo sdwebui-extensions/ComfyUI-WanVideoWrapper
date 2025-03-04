@@ -9,7 +9,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from ...enhance_a_video.enhance import get_feta_scores
 from ...enhance_a_video.globals import is_enhance_enabled
 
-from .attention import attention
+from .attention import attention, swa_flash_attention
 import numpy as np
 __all__ = ['WanModel']
 
@@ -160,6 +160,15 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        # x = swa_flash_attention(
+        #     rope_apply(q, grid_sizes, freqs),
+        #     rope_apply(k, grid_sizes, freqs),
+        #     v,
+        #     grid_sizes
+        # )
+        # x = x.flatten(2)
+        # x = self.o(x)
+        # return x
 
         if is_enhance_enabled():
             feta_scores = get_feta_scores(q, k)
