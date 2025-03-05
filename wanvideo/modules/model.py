@@ -678,13 +678,16 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 #coefficients = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02] # Hunyuan
                 #coefficients = [-3.10658903e+01, 2.54732368e+01, -5.92380459e+00, 1.75769064e+00, -3.61568434e-03] #Cog2b
-                #coefficients = [-1.53880483e+03, 8.43202495e+02, -1.34363087e+02, 7.97131516e+00, -5.23162339e-02] #Cog5b                    
-                #self.accumulated_rel_l1_distance += poly1d(coefficients, ((e0-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()))
+                #coefficients = [-1.53880483e+03, 8.43202495e+02, -1.34363087e+02, 7.97131516e+00, -5.23162339e-02] #Cog5b    
+                # coefficients = [9.39276753e+03, -7.71292297e+02,  5.21083543e+01,  2.53768872e+00, 1.41080799e-02] # wan 1.3b
+                # coefficients = [-3.06553890e+05, 6.48419832e+04, -4.24062284e+03, 1.08991219e+02, -7.94696044e-01] # wan 14b      
+                # self.accumulated_rel_l1_distance += poly1d(coefficients, ((e0-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()))
                 
                 prev_input = self.previous_modulated_input_uncond if is_uncond else self.previous_modulated_input_cond
                 acc_distance_attr = 'accumulated_rel_l1_distance_uncond' if is_uncond else 'accumulated_rel_l1_distance_cond'
 
                 temb_relative_l1 = relative_l1_distance(prev_input, e0)
+                # temb_relative_l1 = poly1d(coefficients, ((e0-prev_input).abs().mean() / prev_input.abs().mean()))
                 setattr(self, acc_distance_attr, getattr(self, acc_distance_attr) + temb_relative_l1)
 
                 if getattr(self, acc_distance_attr) < self.rel_l1_thresh:
