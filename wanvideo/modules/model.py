@@ -513,7 +513,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.enable_teacache = False
         self.teacache_counter = 0
         self.rel_l1_thresh = 0.15
-        self.teacache_start_step= 2
+        self.teacache_start_step= 0
+        self.teacache_end_step = -1
         self.teacache_cache_device = main_device
         # self.l1_history_x = []
         # self.l1_history_temb = []
@@ -667,7 +668,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 self.img_emb.to(self.offload_device, non_blocking=True)
 
         should_calc = True
-        if self.enable_teacache and current_step >= self.teacache_start_step:
+        if self.enable_teacache and self.teacache_start_step <= current_step <= self.teacache_end_step:
             if current_step == self.teacache_start_step:
                 log.info("TeaCache: Initializing TeaCache variables")
                 should_calc = True
