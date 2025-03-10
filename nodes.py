@@ -64,7 +64,7 @@ class WanVideoTeaCache:
         return {
             "required": {
                 "rel_l1_thresh": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.001,
-                                            "tooltip": "Higher values will make TeaCache more aggressive, faster, but may cause artifacts."}),
+                                            "tooltip": "Higher values will make TeaCache more aggressive, faster, but may cause artifacts. Good value range for 1.3B: 0.05 - 0.08, for other models 0.15-0.30"}),
                 "start_step": ("INT", {"default": 1, "min": 0, "max": 9999, "step": 1, "tooltip": "Start percentage of the steps to apply TeaCache"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1, "tooltip": "End steps to apply TeaCache"}),
                 "cache_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Device to cache to"}),
@@ -75,7 +75,28 @@ class WanVideoTeaCache:
     RETURN_NAMES = ("teacache_args",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Speeds up inference by skipping steps"
+    DESCRIPTION = """
+Patch WanVideo model to use TeaCache. Speeds up inference by caching the output and  
+applying it instead of doing the step.  Best results are achieved by choosing the  
+appropriate coefficients for the model. Early steps should never be skipped, with too  
+aggressive values this can happen and the motion suffers. Starting later can help with that too.   
+When NOT using coefficients, the threshold value should be  
+about 10 times smaller than the value used with coefficients.  
+
+Official recommended values https://github.com/ali-vilab/TeaCache/tree/main/TeaCache4Wan2.1:
+
+
+<pre style='font-family:monospace'>
++-------------------+--------+---------+--------+
+|       Model       |  Low   | Medium  |  High  |
++-------------------+--------+---------+--------+
+| Wan2.1 t2v 1.3B  |  0.05  |  0.07   |  0.08  |
+| Wan2.1 t2v 14B   |  0.14  |  0.15   |  0.20  |
+| Wan2.1 i2v 480P  |  0.13  |  0.19   |  0.26  |
+| Wan2.1 i2v 720P  |  0.18  |  0.20   |  0.30  |
++-------------------+--------+---------+--------+
+</pre> 
+"""
     EXPERIMENTAL = True
 
     def process(self, rel_l1_thresh, start_step, end_step, cache_device, use_coefficients):
@@ -457,9 +478,11 @@ class WanVideoModelLoader:
             #compile
             if compile_args is not None:
                 torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-                if compile_args["compile_transformer_blocks"]:
+                if compile_args["compile_transformer_blocks_only"]:
                     for i, block in enumerate(patcher.model.diffusion_model.blocks):
                         patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+                else:
+                    patcher.model.diffusion_model = torch.compile(patcher.model.diffusion_model, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])        
         elif "torchao" in quantization:
             try:
                 from torchao.quantization import (
@@ -592,17 +615,17 @@ class WanVideoTorchCompileSettings:
                 "mode": (["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], {"default": "default"}),
                 "dynamic": ("BOOLEAN", {"default": False, "tooltip": "Enable dynamic mode"}),
                 "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
-                "compile_transformer_blocks": ("BOOLEAN", {"default": True, "tooltip": "Compile single blocks"}),
+                "compile_transformer_blocks_only": ("BOOLEAN", {"default": True, "tooltip": "Compile only the transformer blocks, usually enough and can make compilation faster and less error prone"}),
 
             },
         }
     RETURN_TYPES = ("WANCOMPILEARGS",)
     RETURN_NAMES = ("torch_compile_args",)
-    FUNCTION = "loadmodel"
+    FUNCTION = "set_args"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch 2.5.0 is recommended"
 
-    def loadmodel(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks):
+    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only):
 
         compile_args = {
             "backend": backend,
@@ -610,7 +633,7 @@ class WanVideoTorchCompileSettings:
             "mode": mode,
             "dynamic": dynamic,
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
-            "compile_transformer_blocks": compile_transformer_blocks,
+            "compile_transformer_blocks_only": compile_transformer_blocks_only,
         }
 
         return (compile_args, )
@@ -622,7 +645,7 @@ class LoadWanVideoT5TextEncoder:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae'"}),
+                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
                 "precision": (["fp16", "fp32", "bf16"],
                     {"default": "bf16"}
                 ),
@@ -674,7 +697,7 @@ class LoadWanVideoClipTextEncoder:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae'"}),
+                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
                  "precision": (["fp16", "fp32", "bf16"],
                     {"default": "fp16"}
                 ),
@@ -688,7 +711,7 @@ class LoadWanVideoClipTextEncoder:
     RETURN_NAMES = ("wan_clip_vision", )
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/LLM'"
+    DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/text_encoders'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device"):
         from .wanvideo.modules.clip import CLIPModel
@@ -1339,7 +1362,6 @@ class WanVideoSampler:
                 # Get conditional prediction
                 noise_pred_cond, teacache_state_cond = transformer(
                     z,
-                    is_uncond=False,
                     context=[positive_embeds],
                     pred_id=teacache_state[0] if teacache_state else None,
                     **base_params
@@ -1353,7 +1375,6 @@ class WanVideoSampler:
                 # Get unconditional prediction and apply cfg
                 noise_pred_uncond, teacache_state_uncond = transformer(
                     z,
-                    is_uncond=True,
                     context=negative_embeds,
                     pred_id=teacache_state[1] if teacache_state else None,
                     **base_params

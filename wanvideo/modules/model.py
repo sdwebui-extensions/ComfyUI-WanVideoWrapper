@@ -170,9 +170,6 @@ class WanSelfAttention(nn.Module):
         # x = self.o(x)
         # return x
 
-        if is_enhance_enabled():
-            feta_scores = get_feta_scores(q, k)
-
         if self.attention_mode == 'spargeattn_tune' or self.attention_mode == 'spargeattn':
             tune_mode = False
             if self.attention_mode == 'spargeattn_tune':
@@ -194,20 +191,26 @@ class WanSelfAttention(nn.Module):
                     ).permute(0, 2, 1, 3)
                 #print("inner attention", x.shape) #inner attention torch.Size([1, 12, 32760, 128])
         else:
+            q=rope_apply(q, grid_sizes, freqs)
+            k=rope_apply(k, grid_sizes, freqs)
+            if is_enhance_enabled():
+                feta_scores = get_feta_scores(q, k)
+
             x = attention(
-                q=rope_apply(q, grid_sizes, freqs),
-                k=rope_apply(k, grid_sizes, freqs),
+                q=q,
+                k=k,
                 v=v,
                 k_lens=seq_lens,
                 window_size=self.window_size,
                 attention_mode=self.attention_mode)
-            
-            if is_enhance_enabled():
-                x *= feta_scores
 
         # output
         x = x.flatten(2)
         x = self.o(x)
+
+        if is_enhance_enabled():
+            x *= feta_scores
+
         return x
 
 
@@ -597,7 +600,6 @@ class WanModel(ModelMixin, ConfigMixin):
         device=torch.device('cuda'),
         freqs=None,
         current_step=0,
-        is_uncond=False,
         pred_id=None
     ):
         r"""
