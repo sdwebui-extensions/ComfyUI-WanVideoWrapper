@@ -689,7 +689,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
                 if self.teacache_use_coefficients:
                     rescale_func = np.poly1d(self.teacache_coefficients)
-                    accumulated_rel_l1_distance += rescale_func(((e-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
+                    accumulated_rel_l1_distance += rescale_func(((e0-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
                 else:
                     temb_relative_l1 = relative_l1_distance(previous_modulated_input, e0)
                     accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
@@ -702,7 +702,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     should_calc = True
                     accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            previous_modulated_input = e.clone() if self.teacache_use_coefficients else e0.clone()
+            previous_modulated_input = e0.clone() if self.teacache_use_coefficients else e0.clone()
             if not should_calc:
                 x += previous_residual.to(x.device)
                 #log.info(f"TeaCache: Skipping uncond step {current_step+1}")
