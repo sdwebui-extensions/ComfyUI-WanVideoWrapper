@@ -740,6 +740,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.offload_device, non_blocking=True)
 
+            x = self.head.norm(x).to(torch.float32)
             if self.enable_teacache and pred_id is not None:
                 self.teacache_state.update(
                     pred_id,
@@ -750,8 +751,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 #self.teacache_state.report()
 
         # head
-        x = self.head(x, e)
-        # unpatchify
+        e_unsqueezed = e.unsqueeze(1).to(torch.float32)
+        e_head = (self.head.modulation.to(torch.float32).to(e.device) + e_unsqueezed).chunk(2, dim=1)
+        x = self.head.head(x * (1 + e_head[1].to(torch.float32)) + e_head[0].to(torch.float32))
         x = self.unpatchify(x, grid_sizes)
         return x, pred_id
 
