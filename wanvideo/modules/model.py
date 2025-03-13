@@ -52,8 +52,48 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
 
 from comfy.model_management import get_torch_device, get_autocast_device
 @torch.autocast(device_type=get_autocast_device(get_torch_device()), enabled=False)
-@torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
+    n, c = x.size(2), x.size(3) // 2
+    
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        
+        @torch.compiler.disable()
+        def view_as_complex_no_compile(x):
+            x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+            return x_i
+        
+        x_i = view_as_complex_no_compile(x)
+
+        f_size = (f, 1, 1, -1)
+        h_size = (1, h, 1, -1)
+        w_size = (1, 1, w, -1)
+        
+        freq_cat = torch.cat([
+            freqs[0][:f].view(*f_size).expand(f, h, w, -1),
+            freqs[1][:h].view(*h_size).expand(f, h, w, -1),
+            freqs[2][:w].view(*w_size).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+
+        @torch.compiler.disable()
+        def view_as_real_no_compile(x_i):
+            x_i.mul_(freq_cat)
+            x_i = torch.view_as_real(x_i).flatten(2)
+            return x_i
+       
+        x_i = view_as_real_no_compile(x_i)
+        del freq_cat
+        
+        if seq_len < x.size(1):
+            x_i = torch.cat([x_i, x[i, seq_len:]], dim=0)
+        output.append(x_i)
+    
+    return torch.stack(output).to(torch.float32)
+
+def rope_apply_original(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -636,13 +676,21 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs = freqs.to(device)
             
         if y is not None:
-            x = torch.cat([x, y], dim=0)
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
         if control_enabled:
-            x = [self.expanded_patch_embedding(x.unsqueeze(0))]
+            self.expanded_patch_embedding.to(device)
+            x = [
+            self.expanded_patch_embedding(u.unsqueeze(0))
+            for u in x
+            ]
         else:
-            x = [self.original_patch_embedding(x.unsqueeze(0))]
+            self.original_patch_embedding.to(self.main_device)
+            x = [
+            self.original_patch_embedding(u.unsqueeze(0))
+            for u in x
+            ]
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
@@ -756,7 +804,8 @@ class WanModel(ModelMixin, ConfigMixin):
         # head
         x = self.head.head(x)
         x = self.unpatchify(x, grid_sizes)
-        return x, pred_id
+        x = [u.float() for u in x]
+        return (x, pred_id) if pred_id is not None else (x, None)
 
     def unpatchify(self, x, grid_sizes):
         r"""
@@ -775,11 +824,13 @@ class WanModel(ModelMixin, ConfigMixin):
         """
 
         c = self.out_dim
-        for v in grid_sizes.tolist():
-            x = x[:math.prod(v)].view(*v, *self.patch_size, c)
-            x = torch.einsum('fhwpqrc->cfphqwr', x)
-            x = x.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-        return x
+        out = []
+        for u, v in zip(x, grid_sizes.tolist()):
+            u = u[: math.prod(v)].view(*v, *self.patch_size, c)
+            u = torch.einsum("fhwpqrc->cfphqwr", u)
+            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u)
+        return out
 
 class TeaCacheState:
     def __init__(self, cache_device='cpu'):

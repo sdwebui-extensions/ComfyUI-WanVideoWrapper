@@ -1,7 +1,7 @@
 import os
 import torch
 import gc
-from .utils import log, print_memory
+from .utils import log, print_memory, apply_lora
 import numpy as np
 import math
 from tqdm import tqdm
@@ -223,6 +223,7 @@ class WanVideoLoraSelect:
             "optional": {
                 "prev_lora":("WANVIDLORA", {"default": None, "tooltip": "For loading multiple LoRAs"}),
                 "blocks":("SELECTEDBLOCKS", ),
+                "low_mem_load": ("BOOLEAN", {"default": False, "tooltip": "Load the LORA model with less VRAM usage, slower loading"}),
             }
         }
 
@@ -232,14 +233,15 @@ class WanVideoLoraSelect:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Select a LoRA model from ComfyUI/models/loras"
 
-    def getlorapath(self, lora, strength, blocks=None, prev_lora=None, fuse_lora=False):
+    def getlorapath(self, lora, strength, blocks=None, prev_lora=None, low_mem_load=False):
         loras_list = []
 
         lora = {
             "path": folder_paths.get_full_path("loras", lora),
             "strength": strength,
             "name": lora.split(".")[0],
-            "blocks": blocks
+            "blocks": blocks,
+            "low_mem_load": low_mem_load,
         }
         if prev_lora is not None:
             loras_list.extend(prev_lora)
@@ -283,7 +285,7 @@ class WanVideoModelLoader:
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
             "quantization": (['disabled', 'fp8_e4m3fn', 'fp8_e4m3fn_fast', 'fp8_e5m2', 'torchao_fp8dq', "torchao_fp8dqrow", "torchao_int8dq", "torchao_fp6", "torchao_int4", "torchao_int8"], {"default": 'disabled', "tooltip": "optional quantization method"}),
-            "load_device": (["main_device", "offload_device"], {"default": "main_device"}),
+            "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
                 "attention_mode": ([
@@ -291,8 +293,8 @@ class WanVideoModelLoader:
                     "flash_attn_2",
                     "flash_attn_3",
                     "sageattn",
-                    "spargeattn",
-                    "spargeattn_tune",
+                    #"spargeattn", needs tuning
+                    #"spargeattn_tune",
                     ], {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),
@@ -308,7 +310,12 @@ class WanVideoModelLoader:
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None):
-        assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"        
+        assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
+        lora_low_mem_load = False
+        if lora is not None:
+            for l in lora:
+                lora_low_mem_load = l.get("low_mem_load") if lora is not None else False
+
         transformer = None
         from .wanvideo.modules.model import WanModel
         from accelerate import init_empty_weights
@@ -406,7 +413,6 @@ class WanVideoModelLoader:
           
 
         if not "torchao" in quantization:
-            log.info("Using accelerate to load and assign model weights to device...")
             if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast" or quantization == "fp8_scaled":
                 dtype = torch.float8_e4m3fn
             elif quantization == "fp8_e5m2":
@@ -414,10 +420,17 @@ class WanVideoModelLoader:
             else:
                 dtype = base_dtype
             params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb", "modulation"}
-            for name, param in transformer.named_parameters():
-                #print("Assigning Parameter name: ", name)
-                dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
-                set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
+            #if lora is not None:
+            #    transformer_load_device = device
+            if not lora_low_mem_load:
+                log.info("Using accelerate to load and assign model weights to device...")
+                param_count = sum(1 for _ in transformer.named_parameters())
+                for name, param in tqdm(transformer.named_parameters(), 
+                       desc=f"Loading transformer parameters to {transformer_load_device}", 
+                       total=param_count,
+                       leave=True):
+                    dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
+                    set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
 
             comfy_model.diffusion_model = transformer
             comfy_model.load_device = transformer_load_device
@@ -426,7 +439,6 @@ class WanVideoModelLoader:
             patcher.is_patched = False
             
             if lora is not None:
-               
                 for l in lora:
                     log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
                     lora_path = l["path"]
@@ -468,8 +480,9 @@ class WanVideoModelLoader:
                     patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
                     
                     del lora_sd
-
-                patcher.patch_model(device)
+                
+                patcher = apply_lora(patcher, device, transformer_load_device, params_to_keep=params_to_keep, dtype=dtype, base_dtype=base_dtype, state_dict=sd, low_mem_load=lora_low_mem_load)
+                #patcher.load(device, full_load=True)
                 patcher.is_patched = True
 
             del sd
@@ -1072,6 +1085,11 @@ class WanVideoContextOptions:
             "context_overlap": ("INT", {"default": 16, "min": 4, "max": 100, "step": 1, "tooltip": "Context overlap as pixel frames, NOTE: the latent space has 4 frames in 1"} ),
             "freenoise": ("BOOLEAN", {"default": True, "tooltip": "Shuffle the noise"}),
             "verbose": ("BOOLEAN", {"default": False, "tooltip": "Print debug output"}),
+            },
+            "optional": {
+                "image_cond_start_step": ("INT", {"default": 6, "min": 0, "max": 10000, "step": 1, "tooltip": "!EXPERIMENTAL! Start step of using previous window results as input instead of the init image"}),
+                "image_cond_window_count": ("INT", {"default": 2, "min": 1, "max": 10000, "step": 1, "tooltip": "!EXPERIMENTAL! Number of image 'prompt windows'"}),
+                "vae": ("WANVAE",),
             }
         }
 
@@ -1081,14 +1099,17 @@ class WanVideoContextOptions:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Context options for WanVideo, allows splitting the video into context windows and attemps blending them for longer generations than the model and memory otherwise would allow."
 
-    def process(self, context_schedule, context_frames, context_stride, context_overlap, freenoise, verbose):
+    def process(self, context_schedule, context_frames, context_stride, context_overlap, freenoise, verbose, image_cond_start_step=6, image_cond_window_count=2, vae=None):
         context_options = {
             "context_schedule":context_schedule,
             "context_frames":context_frames,
             "context_stride":context_stride,
             "context_overlap":context_overlap,
             "freenoise":freenoise,
-            "verbose":verbose
+            "verbose":verbose,
+            "image_cond_start_step": image_cond_start_step,
+            "image_cond_window_count": image_cond_window_count,
+            "vae": vae,
         }
 
         return (context_options,)
@@ -1146,6 +1167,7 @@ class WanVideoSampler:
                 "context_options": ("WANVIDCONTEXT", ),
                 "teacache_args": ("TEACACHEARGS", ),
                 "flowedit_args": ("FLOWEDITARGS", ),
+                "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batc cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
             }
         }
 
@@ -1156,7 +1178,7 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None):
+        teacache_args=None, flowedit_args=None, batched_cfg=False):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -1232,6 +1254,7 @@ class WanVideoSampler:
                 device=torch.device("cpu"))
             seq_len = image_embeds["max_seq_len"]
             image_cond = image_embeds.get("image_embeds", None)
+            print("image_cond", image_cond.shape)
             clip_fea = image_embeds.get("clip_context", None)
             
         else: #t2v
@@ -1256,7 +1279,7 @@ class WanVideoSampler:
                 
                 if not patcher.is_patched:
                     print("Patching model for control")
-                    patcher.patch_model(device)
+                    patcher = apply_lora(patcher, device, device, low_mem_load=False)
                     patcher.is_patched = True
             
         latent_video_length = noise.shape[1]
@@ -1283,6 +1306,9 @@ class WanVideoSampler:
             context_frames =  (context_options["context_frames"] - 1) // 4 + 1
             context_stride = context_options["context_stride"] // 4
             context_overlap = context_options["context_overlap"] // 4
+            context_vae = context_options.get("vae", None)
+            if context_vae is not None:
+                context_vae.to(device)
 
             self.window_tracker = WindowTracker(verbose=context_options["verbose"])
 
@@ -1475,33 +1501,39 @@ class WanVideoSampler:
                     'freqs': freqs,
                     't': timestep,
                     'current_step': idx,
-                    'y': image_cond,
+                    'y': [image_cond] if image_cond is not None else None,
                     'control_enabled': control_enabled,
                 }
                 
-                # Get conditional prediction
-                noise_pred_cond, teacache_state_cond = transformer(
-                    z,
-                    context=[positive_embeds],
-                    pred_id=teacache_state[0] if teacache_state else None,
-                    **base_params
-                )
-                noise_pred_cond = noise_pred_cond.to(intermediate_device)
+                if not batched_cfg:
+                    #cond
+                    noise_pred_cond, teacache_state_cond = transformer(
+                        [z], context=[positive_embeds],
+                        pred_id=teacache_state[0] if teacache_state else None,
+                        **base_params
+                    )
+                    noise_pred_cond = noise_pred_cond[0].to(intermediate_device)
+                    if math.isclose(cfg_scale, 1.0): #skip uncond
+                        return noise_pred_cond, [teacache_state_cond]
+                    #uncond
+                    noise_pred_uncond, teacache_state_uncond = transformer(
+                        [z], context=negative_embeds,
+                        pred_id=teacache_state[1] if teacache_state else None,
+                        **base_params
+                    )
+                    noise_pred_uncond=noise_pred_uncond[0].to(intermediate_device)
+                    return noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond), [teacache_state_cond, teacache_state_uncond]
+                #batched
+                else:
+                    [noise_pred_cond, noise_pred_uncond], teacache_state_cond = transformer(
+                        [z] + [z], context= [positive_embeds] + negative_embeds,
+                        pred_id=teacache_state[0] if teacache_state else None,
+                        **base_params
+                    )
+                    noise_pred_uncond=noise_pred_uncond.to(intermediate_device)
+
                 
-                # If cfg_scale is 1.0, return conditional prediction directly
-                if math.isclose(cfg_scale, 1.0):
-                    return noise_pred_cond, [teacache_state_cond]
-                
-                # Get unconditional prediction and apply cfg
-                noise_pred_uncond, teacache_state_uncond = transformer(
-                    z,
-                    context=negative_embeds,
-                    pred_id=teacache_state[1] if teacache_state else None,
-                    **base_params
-                )
-                noise_pred_uncond= noise_pred_uncond.to(intermediate_device)
-                
-                return noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond), [teacache_state_cond, teacache_state_uncond]
+                return noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond), [teacache_state_cond]
         
         try:
             torch.cuda.reset_peak_memory_stats(device)
@@ -1684,16 +1716,34 @@ class WanVideoSampler:
 
                     partial_img_emb = None
                     if image_cond is not None:
+                        log.info(f"Image cond shape: {image_cond.shape}")
+                        num_windows= context_options["image_cond_window_count"]
+                        section_size = latent_video_length / num_windows
+                        image_index = min(int(max(c) / section_size), num_windows - 1)
                         partial_img_emb = image_cond[:, c, :, :]
                         partial_image_cond = image_cond[:, 0, :, :].to(intermediate_device)
-                        if min(c) > 0: #wip
-                            control_strength = 1.0
-                            fade_rate = 0.01
-                            frame_position = min(c)
-                            strength = max(control_strength * (1.0 - (frame_position * fade_rate)), 0.1)
-                            partial_image_cond *= strength
-                        partial_img_emb[:, 0, :, :] =  partial_image_cond
-
+                        log.info(f"image_index: {image_index}")
+                        if hasattr(self, "previous_noise_pred_context") and image_index > 0: #wip
+                            if idx >= context_options["image_cond_start_step"]:
+                                #strength = 0.5
+                                #partial_image_cond *= strength
+                                if context_vae is not None:
+                                    to_decode = self.previous_noise_pred_context[:,-1,:, :].unsqueeze(1).unsqueeze(0).to(context_vae.dtype)
+                                    #to_decode = to_decode.permute(0, 1, 3, 2)
+                                    print("to_decode.shape", to_decode.shape)
+                                    image = context_vae.decode(to_decode, device=device, tiled=False)[0]
+                                    print("decoded image.shape", image.shape) #torch.Size([3, 37, 832, 480])
+                                    image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
+                                    print("encoded image.shape", image.shape)
+                                    #partial_img_emb[:, 0, :, :] = image[0][:,0,:,:]
+                                print("partial_img_emb.shape", partial_img_emb.shape)
+                                mask = torch.ones(4, partial_img_emb.shape[2], partial_img_emb.shape[3], device=partial_img_emb.device, dtype=partial_img_emb.dtype) #torch.Size([20, 10, 104, 60])
+                                print("mask.shape", mask.shape)
+                                print("self.previous_noise_pred_context.shape", self.previous_noise_pred_context.shape) #torch.Size([16, 10, 104, 60])
+                                partial_img_emb[:, 0, :, :] =  torch.cat([image[0][:,0,:,:], mask], dim=0)
+                            else:
+                                partial_img_emb[:, 0, :, :] =  partial_image_cond
+                      
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
                     noise_pred_context, new_teacache = predict_with_cfg(
@@ -1702,8 +1752,15 @@ class WanVideoSampler:
                         text_embeds["negative_prompt_embeds"], 
                         timestep, idx, partial_img_emb, clip_fea,
                         current_teacache)
+
+                    # if callback is not None:
+                    #     callback_latent = (noise_pred.to(t.device) * t / 1000).detach().permute(1,0,2,3)
+                    #     callback(idx, callback_latent, None, steps)
+
                     if teacache_args is not None:
                         self.window_tracker.teacache_states[window_id] = new_teacache
+                    if image_index > 0:
+                        self.previous_noise_pred_context = noise_pred_context
 
                     window_mask = create_window_mask(noise_pred_context, c, latent_video_length, context_overlap, looped=is_looped)                    
                     noise_pred[:, c, :, :] += noise_pred_context * window_mask
