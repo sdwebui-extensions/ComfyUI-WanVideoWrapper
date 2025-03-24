@@ -1821,6 +1821,8 @@ class WanVideoSampler:
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=model["dtype"], enabled=True):
                 nonlocal patcher
                 current_step_percentage = idx / len(timesteps)
+                if nocfg_begin<=current_step_percentage and nocfg_end>=current_step_percentage:
+                    cfg_scale = 1
                 control_enabled = False
                 if control_latents is not None:
                     control_enabled = True
