@@ -20,7 +20,7 @@ from ...utils import log, get_module_memory_mb
 
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 
-def rope_riflex(pos, dim, theta, L_test, k):
+def rope_riflex(pos, dim, theta, L_test, k, temporal):
     from einops import rearrange
     assert dim % 2 == 0
     if mm.is_device_mps(pos.device) or mm.is_intel_xpu() or mm.is_directml_enabled():
@@ -32,7 +32,7 @@ def rope_riflex(pos, dim, theta, L_test, k):
     omega = 1.0 / (theta**scale)
 
     # RIFLEX modification - adjust last frequency component if L_test and k are provided
-    if k and L_test:
+    if temporal and k > 0 and L_test:
         omega[k-1] = 0.9 * 2 * torch.pi / L_test
 
     out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
@@ -52,7 +52,7 @@ class EmbedND_RifleX(nn.Module):
     def forward(self, ids):
         n_axes = ids.shape[-1]
         emb = torch.cat(
-            [rope_riflex(ids[..., i], self.axes_dim[i], self.theta, self.num_frames, self.k if i == 0 else 0) for i in range(n_axes)],
+            [rope_riflex(ids[..., i], self.axes_dim[i], self.theta, self.num_frames, self.k, temporal=True if i == 0 else False) for i in range(n_axes)],
             dim=-3,
         )
         return emb.unsqueeze(1)
@@ -298,7 +298,7 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, clip_fea_tokens=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -338,15 +338,15 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attention_mode = attention_mode
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, clip_fea_tokens=257):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        context_img = context[:, :257]
-        context = context[:, 257:]
+        context_img = context[:, :clip_fea_tokens]
+        context = context[:, clip_fea_tokens:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
@@ -426,6 +426,7 @@ class WanAttentionBlock(nn.Module):
         context,
         context_lens,
         rope_func = "default",
+        clip_fea_tokens=257,
     ):
         r"""
         Args:
@@ -446,13 +447,13 @@ class WanAttentionBlock(nn.Module):
         x = x.to(torch.float32) + (y.to(torch.float32) * e[2].to(torch.float32))
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        def cross_attn_ffn(x, context, context_lens, e, clip_fea_tokens=clip_fea_tokens):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, clip_fea_tokens=clip_fea_tokens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e, clip_fea_tokens=clip_fea_tokens)
         return x
 
 
@@ -797,7 +798,10 @@ class WanModel(ModelMixin, ConfigMixin):
         if self.offload_txt_emb:
             self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
 
+        clip_fea_tokens = 257
         if clip_fea is not None:
+            clip_fea_tokens = clip_fea.shape[1]
+            clip_fea = clip_fea.to(self.main_device)
             if self.offload_img_emb:
                 self.img_emb.to(self.main_device)
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
@@ -855,6 +859,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 freqs=freqs,
                 context=context,
                 context_lens=context_lens,
+                clip_fea_tokens=clip_fea_tokens,
                 rope_func=rope_func
                 )
 

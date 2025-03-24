@@ -1,7 +1,8 @@
 import os
 import torch
+import torch.nn.functional as F
 import gc
-from .utils import log, print_memory, apply_lora
+from .utils import log, print_memory, apply_lora, clip_encode_image_tiled
 import numpy as np
 import math
 from tqdm import tqdm
@@ -945,6 +946,7 @@ class WanVideoImageClipEncode:
     RETURN_NAMES = ("image_embeds",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
+    DEPRECATED = True
 
     def process(self, clip_vision, vae, image, num_frames, generation_width, generation_height, force_offload=True, noise_aug_strength=0.0, 
                 latent_strength=1.0, clip_embed_strength=1.0, adjust_resolution=True):
@@ -1042,6 +1044,226 @@ class WanVideoImageClipEncode:
             "num_frames": num_frames,
             "lat_h": lat_h,
             "lat_w": lat_w,
+        }
+
+        return (image_embeds,)
+
+class WanVideoImageResizeToClosest:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE", {"tooltip": "Image to resize"}),
+            "generation_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+            "generation_height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+            "aspect_ratio_preservation": (["keep_input", "stretch_to_new", "crop_to_new"],),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", )
+    RETURN_NAMES = ("image","width","height",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Resizes image to the closest supported resolution based on aspect ratio and max pixels, according to the original code"
+
+    def process(self, image, generation_width, generation_height, aspect_ratio_preservation ):
+
+        patch_size = (1, 2, 2)
+        vae_stride = (4, 8, 8)
+    
+        H, W = image.shape[1], image.shape[2]
+        max_area = generation_width * generation_height
+
+        crop = "disabled"
+
+        if aspect_ratio_preservation == "keep_input":
+            aspect_ratio = H / W
+        elif aspect_ratio_preservation == "stretch_to_new" or aspect_ratio_preservation == "crop_to_new":
+            aspect_ratio = generation_height / generation_width
+            if aspect_ratio_preservation == "crop_to_new":
+                crop = "center"
+                
+        lat_h = round(
+        np.sqrt(max_area * aspect_ratio) // vae_stride[1] //
+        patch_size[1] * patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // vae_stride[2] //
+            patch_size[2] * patch_size[2])
+        h = lat_h * vae_stride[1]
+        w = lat_w * vae_stride[2]
+
+        resized_image = common_upscale(image.movedim(-1, 1), w, h, "lanczos", crop).movedim(1, -1)
+
+        return (resized_image, w, h)
+    
+#region clip vision
+class WanVideoClipVisionEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "clip_vision": ("CLIP_VISION",),
+            "image_1": ("IMAGE", {"tooltip": "Image to encode"}),
+            "strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}), 
+            "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}),
+            "crop": (["center", "disabled"], {"default": "center", "tooltip": "Crop image to 224x224 before encoding"}),
+            "combine_embeds": (["average", "sum", "concat"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
+            "force_offload": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "image_2": ("IMAGE", ),
+                "tiles": ("INT", {"default": 0, "min": 0, "max": 16, "step": 2, "tooltip": "Use matteo's tiled image encoding for improved accuracy"}),
+                "ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ratio of the tile average"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_CLIPEMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, clip_vision, image_1, strength_1, strength_2, force_offload, crop, combine_embeds, image_2=None, tiles=0, ratio=1.0):
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+
+        if image_2 is not None:
+            image = torch.cat([image_1, image_2], dim=0)
+        else:
+            image = image_1
+
+        clip_vision.model.to(device)
+        image = image.to(device)
+
+        if tiles > 0:
+            log.info("Using tiled image encoding")
+            clip_embeds = clip_encode_image_tiled(clip_vision, image, tiles=tiles, ratio=ratio)
+        else:
+            if isinstance(clip_vision, ClipVisionModel):
+                clip_embeds = clip_vision.encode_image(image).last_hidden_state.to(device)
+            else:
+                pixel_values = clip_preprocess(image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
+                clip_embeds = clip_vision.visual(pixel_values)
+        log.info(f"Clip embeds shape: {clip_embeds.shape}")
+        
+        if clip_embeds.shape[0] > 1:
+            embed_1 = clip_embeds[0:1] * strength_1
+            embed_2 = clip_embeds[1:2] * strength_2
+            if combine_embeds == "average":
+                clip_embeds = torch.mean(torch.stack([embed_1, embed_2]), dim=0)
+            elif combine_embeds == "sum":
+                clip_embeds = torch.sum(torch.stack([embed_1, embed_2]), dim=0)
+            elif combine_embeds == "concat":
+                clip_embeds = torch.cat([embed_1, embed_2], dim=1)
+
+            log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
+        
+        if force_offload:
+            clip_vision.model.to(offload_device)
+            mm.soft_empty_cache()
+
+        return (clip_embeds,)
+
+class WanVideoImageToVideoEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "start_image": ("IMAGE", {"tooltip": "Image to encode"}),
+            "vae": ("WANVAE",),
+            "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+            "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+            "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
+            "noise_aug_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of noise augmentation, helpful for I2V where some noise can add motion and give sharper results"}),
+            "start_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
+            "end_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
+            "force_offload": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "end_image": ("IMAGE", {"tooltip": "end frame"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, vae, start_image, width, height, num_frames, clip_embeds, force_offload, noise_aug_strength, 
+                start_latent_strength, end_latent_strength, end_image=None):
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        patch_size = (1, 2, 2)
+
+        H = height
+        W = width
+           
+        lat_h = H // 8
+        lat_w = W // 8
+        
+        base_frames = num_frames + (1 if end_image is not None else 0)
+        mask = torch.zeros(1, base_frames, lat_h, lat_w, device=device)
+        mask[:, 0] = 1  # First frame
+        if end_image is not None:
+            mask[:, -1] = 1  # End frame if exists
+
+        # Repeat first frame and optionally end frame
+        start_mask_repeated = torch.repeat_interleave(mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
+        if end_image is not None:
+            end_mask_repeated = torch.repeat_interleave(mask[:, -1:], repeats=4, dim=1) # T, C, H, W
+            mask = torch.cat([start_mask_repeated, mask[:, 1:-1], end_mask_repeated], dim=1)
+        else:
+            mask = torch.cat([start_mask_repeated, mask[:, 1:]], dim=1)
+
+        # Reshape mask into groups of 4 frames
+        mask = mask.view(1, mask.shape[1] // 4, 4, lat_h, lat_w) # 1, T, C, H, W
+        mask = mask.movedim(1, 2)[0]# C, T, H, W
+
+        # Resize and rearrange the input image dimensions
+        resized_image = common_upscale(start_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
+        resized_image = resized_image * 2 - 1
+        if noise_aug_strength > 0.0:
+            resized_image = add_noise_to_reference_video(resized_image, ratio=noise_aug_strength)
+        
+        if end_image is not None:
+            resized_end_image = common_upscale(end_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
+            resized_end_image = resized_end_image * 2 - 1
+            if noise_aug_strength > 0.0:
+                resized_end_image = add_noise_to_reference_video(resized_end_image, ratio=noise_aug_strength)
+            
+        # Concatenate image with zero frames and encode
+        vae.to(device)
+
+        zero_frames = torch.zeros(3, num_frames-1, H, W, device=device)
+        concatenated = torch.cat([resized_image.to(device), zero_frames], dim=1) * start_latent_strength
+        if end_image is not None:
+            concatenated = torch.cat([resized_image.to(device), zero_frames, resized_end_image.to(device)], dim=1) * end_latent_strength            
+
+        y = vae.encode([concatenated.to(device=device, dtype=vae.dtype)], device, end_=(end_image is not None))[0]
+        y = torch.cat([mask, y])
+
+        # Calculate maximum sequence length
+        patches_per_frame = lat_h * lat_w // (patch_size[1] * patch_size[2])
+        frames_per_stride = (num_frames - 1) // 4 + (2 if end_image is not None else 1)
+        max_seq_len = frames_per_stride * patches_per_frame
+
+        vae.model.clear_cache()
+        if force_offload:
+            vae.model.to(offload_device)
+            mm.soft_empty_cache()
+            gc.collect()
+
+        image_embeds = {
+            "image_embeds": y,
+            "clip_context": clip_embeds,
+            "max_seq_len": max_seq_len,
+            "num_frames": num_frames,
+            "lat_h": lat_h,
+            "lat_w": lat_w,
+            "end_image": resized_end_image if end_image is not None else None
         }
 
         return (image_embeds,)
@@ -1334,14 +1556,16 @@ class WanVideoSampler:
         image_cond = None
         clip_fea = None
         control_latents = None
+        end_image = None
         if transformer.model_type == "i2v":
+            end_image = image_embeds.get("end_image", None)
             lat_h = image_embeds.get("lat_h", None)
             lat_w = image_embeds.get("lat_w", None)
             if lat_h is None or lat_w is None:
                 raise ValueError("Clip encoded image embeds must be provided for I2V (Image to Video) model")
             noise = torch.randn(
                 16,
-                (image_embeds["num_frames"] - 1) // 4 + 1,
+                (image_embeds["num_frames"] - 1) // 4 + (2 if end_image is not None else 1),
                 lat_h,
                 lat_w,
                 dtype=torch.float32,
@@ -1977,7 +2201,7 @@ class WanVideoSampler:
             pass
 
         return ({
-            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped
+            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped, "end_image": end_image
             }, )
     
 class WindowTracker:
@@ -2029,6 +2253,8 @@ class WanVideoDecode:
         offload_device = mm.unet_offload_device()
         mm.soft_empty_cache()
         latents = samples["samples"]
+        end_image = samples.get("end_image", None)
+
         vae.to(device)
 
         latents = latents.to(device = device, dtype = vae.dtype)
@@ -2038,27 +2264,41 @@ class WanVideoDecode:
         is_looped = samples.get("looped", False)
         warmup_latent_count = 3
 
-        if is_looped:
-            latents = torch.cat([latents, latents[:, :, :warmup_latent_count]], dim=2)
+        #if is_looped:
+        #   latents = torch.cat([latents[:, :, :warmup_latent_count],latents], dim=2)
 
         if isinstance(vae, TAEHV):            
-            image = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
+            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
         else:
-            image = vae.decode(latents, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))[0]
-            vae.model.clear_cache()
-            image = (image - image.min()) / (image.max() - image.min())
-        vae.to(offload_device)
+            if end_image is not None:
+                enable_vae_tiling = False
+            images = vae.decode(latents, device=device, end_=(end_image is not None), tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))[0]
+        vae.model.clear_cache()
+
+        images = (images - images.min()) / (images.max() - images.min())      
 
         if is_looped:
-            image = image[:, warmup_latent_count * 4:]
-        
+            #images = images[:, warmup_latent_count * 4:]
+            temp_latents = torch.cat([latents[:, :, -3:]] + [latents[:, :, :2]], dim=2)
+            temp_images = vae.decode(temp_latents, device=device, end_=(end_image is not None), tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))[0]
+            temp_images = (temp_images - temp_images.min()) / (temp_images.max() - temp_images.min())
+            out = temp_images[:, 9:]
+            out = torch.cat([out, images[:, 5:]], dim=1)
+            images = out
+
+        if end_image is not None: 
+            #end_image = (end_image - end_image.min()) / (end_image.max() - end_image.min())
+            #image[:, -1] = end_image[:, 0].to(image) #not sure about this
+            images = images[:, 0:-1]
+
+        vae.model.clear_cache()
+        vae.to(offload_device)
         mm.soft_empty_cache()
 
-        
-        image = torch.clamp(image, 0.0, 1.0)
-        image = image.permute(1, 2, 3, 0).cpu().float()
+        images = torch.clamp(images, 0.0, 1.0)
+        images = images.permute(1, 2, 3, 0).cpu().float()
 
-        return (image,)
+        return (images,)
 
 #region VideoEncode
 class WanVideoEncode:
@@ -2216,7 +2456,9 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoModelLoader": WanVideoModelLoader,
     "WanVideoVAELoader": WanVideoVAELoader,
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
-    "WanVideoImageClipEncode": WanVideoImageClipEncode,
+    "WanVideoImageClipEncode": WanVideoImageClipEncode,#deprecated
+    "WanVideoClipVisionEncode": WanVideoClipVisionEncode,
+    "WanVideoImageToVideoEncode": WanVideoImageToVideoEncode,
     "LoadWanVideoClipTextEncoder": LoadWanVideoClipTextEncoder,
     "WanVideoEncode": WanVideoEncode,
     "WanVideoBlockSwap": WanVideoBlockSwap,
@@ -2234,7 +2476,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
     "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
-    "WanVideoLoopArgs": WanVideoLoopArgs
+    "WanVideoLoopArgs": WanVideoLoopArgs,
+    "WanVideoImageResizeToClosest": WanVideoImageResizeToClosest,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -2244,7 +2487,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoModelLoader": "WanVideo Model Loader",
     "WanVideoVAELoader": "WanVideo VAE Loader",
     "LoadWanVideoT5TextEncoder": "Load WanVideo T5 TextEncoder",
-    "WanVideoImageClipEncode": "WanVideo ImageClip Encode",
+    "WanVideoImageClipEncode": "WanVideo ImageClip Encode (Deprecated)",
+    "WanVideoClipVisionEncode": "WanVideo ClipVision Encode",
+    "WanVideoImageToVideoEncode": "WanVideo ImageToVideo Encode",
     "LoadWanVideoClipTextEncoder": "Load WanVideo Clip Encoder",
     "WanVideoEncode": "WanVideo Encode",
     "WanVideoBlockSwap": "WanVideo BlockSwap",
@@ -2262,5 +2507,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
     "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
-    "WanVideoLoopArgs": "WanVideo Loop Args"
+    "WanVideoLoopArgs": "WanVideo Loop Args",
+    "WanVideoImageResizeToClosest": "WanVideo Image Resize To Closest",
     }
