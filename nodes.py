@@ -620,12 +620,39 @@ class WanVideoModelLoader:
         patcher.model["model_name"] = model
         patcher.model["manual_offloading"] = manual_offloading
         patcher.model["quantization"] = "disabled"
-        patcher.model["block_swap_args"] = block_swap_args
         patcher.model["auto_cpu_offload"] = True if vram_management_args is not None else False
+
+        if 'transformer_options' not in patcher.model_options:
+            patcher.model_options['transformer_options'] = {}
+        patcher.model_options["transformer_options"]["block_swap_args"] = block_swap_args   
 
         for model in mm.current_loaded_models:
             if model._model() == patcher:
                 mm.current_loaded_models.remove(model)            
+
+        return (patcher,)
+
+class WanVideoSetBlockSwap:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "block_swap_args": ("BLOCKSWAPARGS", ),
+               }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "loadmodel"
+    CATEGORY = "WanVideoWrapper"
+
+    def loadmodel(self, model, block_swap_args):
+
+        patcher = model.clone()
+        if 'transformer_options' not in patcher.model_options:
+            patcher.model_options['transformer_options'] = {}
+        patcher.model_options["transformer_options"]["block_swap_args"] = block_swap_args     
 
         return (patcher,)
 
@@ -858,7 +885,7 @@ class WanVideoTextEncode:
     RETURN_NAMES = ("text_embeds",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Encodes text prompts into text embeddings. For context windowing you can input multiple prompts separated by '|'"
+    DESCRIPTION = "Encodes text prompts into text embeddings. For rudimentary prompt travel you can input multiple prompts separated by '|', they will be equally spread over the video length"
 
     def process(self, t5, positive_prompt, negative_prompt,force_offload=True, model_to_offload=None):
 
@@ -873,18 +900,28 @@ class WanVideoTextEncode:
         encoder = t5["model"]
         dtype = t5["dtype"]
 
-        # Split positive prompts and process each
-        positive_prompts = [p.strip() for p in positive_prompt.split('|')]
-
+        # Split positive prompts and process each with weights
+        positive_prompts_raw = [p.strip() for p in positive_prompt.split('|')]
+        positive_prompts = []
+        all_weights = []
+        
+        for p in positive_prompts_raw:
+            cleaned_prompt, weights = self.parse_prompt_weights(p)
+            positive_prompts.append(cleaned_prompt)
+            all_weights.append(weights)
+        
         encoder.model.to(device)
        
         with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True):
             context = encoder(positive_prompts, device)
             context_null = encoder([negative_prompt], device)
 
-
-        context = [t.to(device) for t in context]
-        context_null = [t.to(device) for t in context_null]
+            # Apply weights to embeddings if any were extracted
+            for i, weights in enumerate(all_weights):
+                for text, weight in weights.items():
+                    log.info(f"Applying weight {weight} to prompt: {text}")
+                    if len(weights) > 0:
+                        context[i] = context[i] * weight
 
         if force_offload:
             encoder.model.to(offload_device)
@@ -896,6 +933,26 @@ class WanVideoTextEncode:
                 "negative_prompt_embeds": context_null,
             }
         return (prompt_embeds_dict,)
+    
+    def parse_prompt_weights(self, prompt):
+        """Extract text and weights from prompts with (text:weight) format"""
+        import re
+        
+        # Parse all instances of (text:weight) in the prompt
+        pattern = r'\((.*?):([\d\.]+)\)'
+        matches = re.findall(pattern, prompt)
+        
+        # Replace each match with just the text part
+        cleaned_prompt = prompt
+        weights = {}
+        
+        for match in matches:
+            text, weight = match
+            orig_text = f"({text}:{weight})"
+            cleaned_prompt = cleaned_prompt.replace(orig_text, text)
+            weights[text] = float(weight)
+            
+        return cleaned_prompt, weights
     
 class WanVideoTextEmbedBridge:
     @classmethod
@@ -1105,11 +1162,12 @@ class WanVideoClipVisionEncode:
             "strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}), 
             "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}),
             "crop": (["center", "disabled"], {"default": "center", "tooltip": "Crop image to 224x224 before encoding"}),
-            "combine_embeds": (["average", "sum", "concat"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
+            "combine_embeds": (["average", "sum", "concat", "batch"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
             "force_offload": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "image_2": ("IMAGE", ),
+                "negative_image": ("IMAGE", {"tooltip": "image to use for uncond"}),
                 "tiles": ("INT", {"default": 0, "min": 0, "max": 16, "step": 2, "tooltip": "Use matteo's tiled image encoding for improved accuracy"}),
                 "ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ratio of the tile average"}),
             }
@@ -1120,7 +1178,7 @@ class WanVideoClipVisionEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, clip_vision, image_1, strength_1, strength_2, force_offload, crop, combine_embeds, image_2=None, tiles=0, ratio=1.0):
+    def process(self, clip_vision, image_1, strength_1, strength_2, force_offload, crop, combine_embeds, image_2=None, negative_image=None, tiles=0, ratio=1.0):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1134,18 +1192,26 @@ class WanVideoClipVisionEncode:
             image = image_1
 
         clip_vision.model.to(device)
-        image = image.to(device)
+        negative_clip_embeds = None
 
         if tiles > 0:
             log.info("Using tiled image encoding")
-            clip_embeds = clip_encode_image_tiled(clip_vision, image, tiles=tiles, ratio=ratio)
+            clip_embeds = clip_encode_image_tiled(clip_vision, image.to(device), tiles=tiles, ratio=ratio)
+            if negative_image is not None:
+                negative_clip_embeds = clip_encode_image_tiled(clip_vision, negative_image.to(device), tiles=tiles, ratio=ratio)
         else:
             if isinstance(clip_vision, ClipVisionModel):
                 clip_embeds = clip_vision.encode_image(image).last_hidden_state.to(device)
+                if negative_image is not None:
+                    negative_clip_embeds = clip_vision.encode_image(negative_image).last_hidden_state.to(device)
             else:
                 pixel_values = clip_preprocess(image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
                 clip_embeds = clip_vision.visual(pixel_values)
+                if negative_image is not None:
+                    pixel_values = clip_preprocess(negative_image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
+                    negative_clip_embeds = clip_vision.visual(pixel_values)
         log.info(f"Clip embeds shape: {clip_embeds.shape}")
+
         
         if clip_embeds.shape[0] > 1:
             embed_1 = clip_embeds[0:1] * strength_1
@@ -1156,6 +1222,9 @@ class WanVideoClipVisionEncode:
                 clip_embeds = torch.sum(torch.stack([embed_1, embed_2]), dim=0)
             elif combine_embeds == "concat":
                 clip_embeds = torch.cat([embed_1, embed_2], dim=1)
+            elif combine_embeds == "batch":
+                clip_embeds = torch.cat([embed_1, embed_2], dim=0)
+                
 
             log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
         
@@ -1163,7 +1232,12 @@ class WanVideoClipVisionEncode:
             clip_vision.model.to(offload_device)
             mm.soft_empty_cache()
 
-        return (clip_embeds,)
+        clip_embeds_dict = {
+            "clip_embeds": clip_embeds,
+            "negative_clip_embeds": negative_clip_embeds
+        }
+
+        return (clip_embeds_dict,)
 
 class WanVideoImageToVideoEncode:
     @classmethod
@@ -1258,7 +1332,8 @@ class WanVideoImageToVideoEncode:
 
         image_embeds = {
             "image_embeds": y,
-            "clip_context": clip_embeds,
+            "clip_context": clip_embeds.get("clip_embeds", None),
+            "negative_clip_context": clip_embeds.get("negative_clip_embeds", None),
             "max_seq_len": max_seq_len,
             "num_frames": num_frames,
             "lat_h": lat_h,
@@ -1553,10 +1628,9 @@ class WanVideoSampler:
         
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
-        image_cond = None
-        clip_fea = None
-        control_latents = None
-        end_image = None
+       
+        image_cond, control_latents, clip_fea, clip_fea_neg, end_image = None, None, None, None, None
+       
         if transformer.model_type == "i2v":
             end_image = image_embeds.get("end_image", None)
             lat_h = image_embeds.get("lat_h", None)
@@ -1575,7 +1649,7 @@ class WanVideoSampler:
             image_cond = image_embeds.get("image_embeds", None)
             print("image_cond", image_cond.shape)
             clip_fea = image_embeds.get("clip_context", None)
-            
+            clip_fea_neg = image_embeds.get("negative_clip_context", None)            
         else: #t2v
             target_shape = image_embeds.get("target_shape", None)
             if target_shape is None:
@@ -1701,21 +1775,25 @@ class WanVideoSampler:
         from .latent_preview import prepare_callback
         callback = prepare_callback(patcher, steps)
 
-        #blockswap init
-        if model["block_swap_args"] is not None:
-            transformer.use_non_blocking = model["block_swap_args"].get("use_non_blocking", True)
+        #blockswap init        
+        transformer_options = patcher.model_options.get("transformer_options", None)
+        if transformer_options is not None:
+            block_swap_args = transformer_options.get("block_swap_args", None)
+
+        if block_swap_args is not None:
+            transformer.use_non_blocking = block_swap_args.get("use_non_blocking", True)
             for name, param in transformer.named_parameters():
                 if "block" not in name:
                     param.data = param.data.to(device)
-                elif model["block_swap_args"]["offload_txt_emb"] and "txt_emb" in name:
+                elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
                     param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
-                elif model["block_swap_args"]["offload_img_emb"] and "img_emb" in name:
+                elif block_swap_args["offload_img_emb"] and "img_emb" in name:
                     param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
 
             transformer.block_swap(
-                model["block_swap_args"]["blocks_to_swap"] - 1 ,
-                model["block_swap_args"]["offload_txt_emb"],
-                model["block_swap_args"]["offload_img_emb"],
+                block_swap_args["blocks_to_swap"] - 1 ,
+                block_swap_args["offload_txt_emb"],
+                block_swap_args["offload_img_emb"],
             )
 
         elif model["auto_cpu_offload"]:
@@ -1788,7 +1866,7 @@ class WanVideoSampler:
             source_embeds = flowedit_args["source_embeds"]
             source_image_embeds = flowedit_args.get("source_image_embeds", image_embeds)
             source_image_cond = source_image_embeds.get("image_embeds", None)
-            source_clip_fea = source_image_embeds.get("clip_fea", None)
+            source_clip_fea = source_image_embeds.get("clip_fea", clip_fea)
             skip_steps = flowedit_args["skip_steps"]
             drift_steps = flowedit_args["drift_steps"]
             source_cfg = flowedit_args["source_cfg"]
@@ -1840,7 +1918,6 @@ class WanVideoSampler:
                             patcher.model.is_patched = True
     
                 base_params = {
-                    'clip_fea': clip_fea,
                     'seq_len': seq_len,
                     'device': device,
                     'freqs': freqs,
@@ -1853,7 +1930,7 @@ class WanVideoSampler:
                 if not batched_cfg:
                     #cond
                     noise_pred_cond, teacache_state_cond = transformer(
-                        [z], context=[positive_embeds], is_uncond=False, current_step_percentage=current_step_percentage,
+                        [z], context=positive_embeds, clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[0] if teacache_state else None,
                         **base_params
                     )
@@ -1862,7 +1939,8 @@ class WanVideoSampler:
                         return noise_pred_cond, [teacache_state_cond]
                     #uncond
                     noise_pred_uncond, teacache_state_uncond = transformer(
-                        [z], context=negative_embeds, is_uncond=True, current_step_percentage=current_step_percentage,
+                        [z], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea, 
+                        is_uncond=True, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[1] if teacache_state else None,
                         **base_params
                     )
@@ -1871,7 +1949,7 @@ class WanVideoSampler:
                 #batched
                 else:
                     [noise_pred_cond, noise_pred_uncond], teacache_state_cond = transformer(
-                        [z] + [z], context= [positive_embeds] + negative_embeds, is_uncond=False, current_step_percentage=current_step_percentage,
+                        [z] + [z], context= positive_embeds + negative_embeds, clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[0] if teacache_state else None,
                         **base_params
                     )
@@ -1969,7 +2047,10 @@ class WanVideoSampler:
                             if context_options["verbose"]:
                                 log.info(f"Prompt index: {prompt_index}")
 
-                            positive = source_embeds["prompt_embeds"][prompt_index]
+                            if len(source_embeds["prompt_embeds"]) > 1:
+                                positive = source_embeds["prompt_embeds"][prompt_index]
+                            else:
+                                positive = source_embeds["prompt_embeds"]
 
                             partial_img_emb = None
                             if source_image_cond is not None:
@@ -1993,7 +2074,7 @@ class WanVideoSampler:
                     else:
                         vt_src, self.teacache_state_source = predict_with_cfg(
                             zt_src, cfg[idx], 
-                            source_embeds["prompt_embeds"][0], 
+                            source_embeds["prompt_embeds"], 
                             source_embeds["negative_prompt_embeds"],
                             timestep, idx, source_image_cond, 
                             source_clip_fea,
@@ -2020,7 +2101,10 @@ class WanVideoSampler:
                         if context_options["verbose"]:
                             log.info(f"Prompt index: {prompt_index}")
                      
-                        positive = text_embeds["prompt_embeds"][prompt_index]
+                        if len(text_embeds["prompt_embeds"]) > 1:
+                            positive = text_embeds["prompt_embeds"][prompt_index]
+                        else:
+                            positive = text_embeds["prompt_embeds"]
                         
                         partial_img_emb = None
                         if image_cond is not None:
@@ -2044,7 +2128,7 @@ class WanVideoSampler:
                 else:
                     vt_tgt, self.teacache_state = predict_with_cfg(
                         zt_tgt, cfg[idx], 
-                        text_embeds["prompt_embeds"][0], 
+                        text_embeds["prompt_embeds"], 
                         text_embeds["negative_prompt_embeds"], 
                         timestep, idx, image_cond, clip_fea,
                         teacache_state=self.teacache_state)
@@ -2072,7 +2156,10 @@ class WanVideoSampler:
                         log.info(f"Prompt index: {prompt_index}")
                     
                     # Use the appropriate prompt for this section
-                    positive = text_embeds["prompt_embeds"][prompt_index]
+                    if len(text_embeds["prompt_embeds"]) > 1:
+                        positive = text_embeds["prompt_embeds"][prompt_index]
+                    else:
+                        positive = text_embeds["prompt_embeds"]
 
                     partial_img_emb = None
                     if image_cond is not None:
@@ -2136,7 +2223,7 @@ class WanVideoSampler:
                 noise_pred, self.teacache_state = predict_with_cfg(
                     latent_model_input, 
                     cfg[idx], 
-                    text_embeds["prompt_embeds"][0], 
+                    text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
                     timestep, idx, image_cond, clip_fea,
                     teacache_state=self.teacache_state)
@@ -2480,6 +2567,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
     "WanVideoLoopArgs": WanVideoLoopArgs,
     "WanVideoImageResizeToClosest": WanVideoImageResizeToClosest,
+    "WanVideoSetBlockSwap": WanVideoSetBlockSwap,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -2511,4 +2599,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
     "WanVideoLoopArgs": "WanVideo Loop Args",
     "WanVideoImageResizeToClosest": "WanVideo Image Resize To Closest",
+    "WanVideoSetBlockSwap": "WanVideo Set BlockSwap",
     }
