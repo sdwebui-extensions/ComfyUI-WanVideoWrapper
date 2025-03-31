@@ -633,6 +633,7 @@ class WanVideoModelLoader:
             log.info(f"Quantizing model with {quant_func}")
             comfy_model.diffusion_model = transformer
             patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
+            control_lora = False
 
             for i, block in enumerate(patcher.model.diffusion_model.blocks):
                 log.info(f"Quantizing block {i}")
