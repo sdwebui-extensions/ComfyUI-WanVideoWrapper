@@ -602,6 +602,9 @@ class WanVideoModelLoader:
                 if compile_args["compile_transformer_blocks_only"]:
                     for i, block in enumerate(patcher.model.diffusion_model.blocks):
                         patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+                    if vace_layers is not None:
+                        for i, block in enumerate(patcher.model.diffusion_model.vace_blocks):
+                            patcher.model.diffusion_model.vace_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
                 else:
                     patcher.model.diffusion_model = torch.compile(patcher.model.diffusion_model, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])        
             
@@ -875,6 +878,8 @@ class LoadWanVideoT5TextEncoder:
         
         if "token_embedding.weight" not in sd and "shared.weight" not in sd:
             raise ValueError("Invalid T5 text encoder model, this node expects the 'umt5-xxl' model")
+        if "scaled_fp8" in sd:
+            raise ValueError("Invalid T5 text encoder model, fp8 scaled is not supported by this node")
 
         # Convert state dict keys from T5 format to the expected format
         if "shared.weight" in sd:
@@ -1764,6 +1769,62 @@ class WanVideoVACEEncode:
     def vace_latent(self, z, m):
         return [torch.cat([zz, mm], dim=0) for zz, mm in zip(z, m)]
 
+class WanVideoVACEStartToEndFrame:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+            "empty_frame_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "White level of empty frame to use"}),
+            },
+            "optional": {
+                "start_image": ("IMAGE",),
+                "end_image": ("IMAGE",),
+                "control_images": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", )
+    RETURN_NAMES = ("images", "masks",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Helper node to create start/end frame batch and masks for VACE"
+
+    def process(self, num_frames, empty_frame_level, start_image=None, end_image=None, control_images=None):
+        
+        B, H, W, C = start_image.shape if start_image is not None else end_image.shape
+        device = start_image.device if start_image is not None else end_image.device
+
+        masks = torch.ones((num_frames, H, W), device=device)
+
+        if control_images is not None:
+            control_images = common_upscale(control_images.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+        
+        if start_image is not None and end_image is not None:
+            if start_image.shape != end_image.shape:
+                end_image = common_upscale(end_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+            if control_images is None:
+                empty_frames = torch.ones((num_frames - start_image.shape[0] - end_image.shape[0], H, W, 3), device=device) * empty_frame_level
+            else:
+                empty_frames = control_images[start_image.shape[0]:num_frames - end_image.shape[0]]
+            out_batch = torch.cat([start_image, empty_frames, end_image], dim=0)
+            masks[0:start_image.shape[0]] = 0
+            masks[-end_image.shape[0]:] = 0
+        elif start_image is not None:
+            if control_images is None:
+                empty_frames = torch.ones((num_frames - start_image.shape[0], H, W, 3), device=device) * empty_frame_level
+            else:
+                empty_frames = control_images[start_image.shape[0]:num_frames]
+            out_batch = torch.cat([start_image, empty_frames], dim=0)
+            masks[0:start_image.shape[0]] = 0
+        elif end_image is not None:
+            if control_images is None:
+                empty_frames = torch.ones((num_frames - end_image.shape[0], H, W, 3), device=device) * empty_frame_level
+            else:
+                empty_frames = control_images[:num_frames - end_image.shape[0]]
+            out_batch = torch.cat([empty_frames, end_image], dim=0)
+            masks[-end_image.shape[0]:] = 0
+    
+        return (out_batch.cpu().float(), masks.cpu().float())
 
 #region Sampler
 
@@ -2218,10 +2279,6 @@ class WanVideoSampler:
         else:
             transformer.slg_blocks = None
 
-        mm.unload_all_models()
-        mm.soft_empty_cache()
-        gc.collect()
-
         self.teacache_state = [None, None]
         self.teacache_state_source = [None, None]
         self.teacache_states_context = []
@@ -2312,7 +2369,8 @@ class WanVideoSampler:
                 if vace_context is not None:
                     vace_context_input = vace_context
                     if not (vace_start_percent <= current_step_percentage <= vace_end_percent) or \
-                            (vace_end_percent > 0 and idx == 0 and current_step_percentage >= vace_start_percent):
+                        (vace_end_percent < 1.0 and vace_end_percent > 0 and idx == 0 and 
+                         (current_step_percentage >= vace_start_percent and current_step_percentage > vace_end_percent)):
                         vace_context_input = None
     
                 base_params = {
@@ -2371,11 +2429,6 @@ class WanVideoSampler:
                     noise_pred_uncond=noise_pred_uncond.to(intermediate_device)
 
                 return noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond), [teacache_state_cond]
-        
-        try:
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
 
         log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*8}x{latent.shape[2]*8} with {steps} steps")
 
@@ -2398,7 +2451,17 @@ class WanVideoSampler:
             latent_shift_start_percent = loop_args["start_percent"]
             latent_shift_end_percent = loop_args["end_percent"]
             shift_idx = 0
-        #main loop start
+
+        #clear memory before sampling
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+        gc.collect()
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except:
+            pass
+
+        #region main loop start
         for idx, t in enumerate(tqdm(timesteps)):    
             if flowedit_args is not None:
                 if idx < skip_steps:
@@ -2620,13 +2683,14 @@ class WanVideoSampler:
                         partial_vace_context = vace_context[0][:, c, :, :]
                         if has_ref:
                             partial_vace_context[:, 0, :, :] = vace_context[0][:, 0, :, :]
+                        partial_vace_context = [partial_vace_context]
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
                     noise_pred_context, new_teacache = predict_with_cfg(
                         partial_latent_model_input, 
                         cfg[idx], positive, 
                         text_embeds["negative_prompt_embeds"], 
-                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, [partial_vace_context],
+                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context,
                         current_teacache)
 
                     # if callback is not None:
@@ -2931,6 +2995,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSetBlockSwap": WanVideoSetBlockSwap,
     "WanVideoExperimentalArgs": WanVideoExperimentalArgs,
     "WanVideoVACEEncode": WanVideoVACEEncode,
+    "WanVideoVACEStartToEndFrame": WanVideoVACEStartToEndFrame,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -2964,4 +3029,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSetBlockSwap": "WanVideo Set BlockSwap",
     "WanVideoExperimentalArgs": "WanVideo Experimental Args",
     "WanVideoVACEEncode": "WanVideo VACE Encode",
+    "WanVideoVACEStartToEndFrame": "WanVideo VACE Start To End Frame",
     }

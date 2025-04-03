@@ -807,7 +807,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.img_emb = MLPProj(1280, dim)
 
     def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False, vace_blocks_to_swap=None):
-        print(f"Swapping {blocks_to_swap + 1} transformer blocks")
+        log.info(f"Swapping {blocks_to_swap + 1} transformer blocks")
         self.blocks_to_swap = blocks_to_swap
         
         self.offload_img_emb = offload_img_emb
@@ -1044,7 +1044,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if not self.enable_teacache or (self.enable_teacache and should_calc):
             if self.enable_teacache:
-                original_x = x.clone().to(self.teacache_cache_device)
+                original_x = x.clone().to(self.teacache_cache_device, non_blocking=self.use_non_blocking)
 
             # arguments
             kwargs = dict(
@@ -1085,8 +1085,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 self.teacache_state.update(
                     pred_id,
                     previous_residual=(x.to(original_x.device) - original_x),
-                    accumulated_rel_l1_distance=accumulated_rel_l1_distance.to(self.teacache_cache_device),
-                    previous_modulated_input=previous_modulated_input.to(self.teacache_cache_device)
+                    accumulated_rel_l1_distance=accumulated_rel_l1_distance.to(self.teacache_cache_device, non_blocking=self.use_non_blocking),
+                    previous_modulated_input=previous_modulated_input.to(self.teacache_cache_device, non_blocking=self.use_non_blocking)
                 )
 
         # head
