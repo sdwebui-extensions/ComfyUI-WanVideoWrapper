@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 import folder_paths
 import comfy.model_management as mm
-from comfy.utils import load_torch_file, save_torch_file, ProgressBar, common_upscale
+from comfy.utils import load_torch_file, ProgressBar, common_upscale
 import comfy.model_base
 import comfy.latent_formats
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -49,6 +49,7 @@ class WanVideoBlockSwap:
             },
             "optional": {
                 "use_non_blocking": ("BOOLEAN", {"default": True, "tooltip": "Use non-blocking memory transfer for offloading, reserves more RAM but is faster"}),
+                "vace_blocks_to_swap": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1, "tooltip": "Number of VACE blocks to swap, the VACE model has 15 blocks"}),
             },
         }
     RETURN_TYPES = ("BLOCKSWAPARGS",)
@@ -210,7 +211,7 @@ def standardize_lora_key_format(lora_sd):
         if "img_attn.qkv" in k:
             k = k.replace("img_attn.qkv", "img_attn_qkv")
         if "txt_attn.proj" in k:
-            k = k.replace("txt_attn.proj ", "txt_attn_proj")
+            k = k.replace("txt_attn.proj", "txt_attn_proj")
         if "txt_attn.qkv" in k:
             k = k.replace("txt_attn.qkv", "txt_attn_qkv")
         new_sd[k] = v
@@ -397,6 +398,12 @@ class WanVideoModelLoader:
         num_heads = 40 if dim == 5120 else 12
         num_layers = 40 if dim == 5120 else 30
 
+        vace_layers, vace_in_dim = None, None
+        if "vace_blocks.0.after_proj.weight" in sd:
+            model_type = "t2v"
+            vace_layers = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+            vace_in_dim = 96
+
         log.info(f"Model type: {model_type}, num_heads: {num_heads}, num_layers: {num_layers}")
 
         teacache_coefficients_map = {
@@ -443,6 +450,8 @@ class WanVideoModelLoader:
             "main_device": device,
             "offload_device": offload_device,
             "teacache_coefficients": teacache_coefficients_map[model_variant],
+            "vace_layers": vace_layers,
+            "vace_in_dim": vace_in_dim
         }
 
         with init_empty_weights():
@@ -585,6 +594,11 @@ class WanVideoModelLoader:
             #compile
             if compile_args is not None and vram_management_args is None:
                 torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+                try:
+                    if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
+                        torch._dynamo.config.recompile_limit = compile_args["dynamo_recompile_limit"]
+                except Exception as e:
+                    log.warning(f"Could not set recompile_limit: {e}")
                 if compile_args["compile_transformer_blocks_only"]:
                     for i, block in enumerate(patcher.model.diffusion_model.blocks):
                         patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
@@ -795,7 +809,9 @@ class WanVideoTorchCompileSettings:
                 "dynamic": ("BOOLEAN", {"default": False, "tooltip": "Enable dynamic mode"}),
                 "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
                 "compile_transformer_blocks_only": ("BOOLEAN", {"default": True, "tooltip": "Compile only the transformer blocks, usually enough and can make compilation faster and less error prone"}),
-
+            },
+            "optional": {
+                "dynamo_recompile_limit": ("INT", {"default": 128, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.recompile_limit"}),
             },
         }
     RETURN_TYPES = ("WANCOMPILEARGS",)
@@ -804,7 +820,7 @@ class WanVideoTorchCompileSettings:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch 2.5.0 is recommended"
 
-    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only):
+    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128):
 
         compile_args = {
             "backend": backend,
@@ -812,6 +828,7 @@ class WanVideoTorchCompileSettings:
             "mode": mode,
             "dynamic": dynamic,
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
+            "dynamo_recompile_limit": dynamo_recompile_limit,
             "compile_transformer_blocks_only": compile_transformer_blocks_only,
         }
 
@@ -932,7 +949,7 @@ class LoadWanVideoClipTextEncoder:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
+                "model_name": (folder_paths.get_filename_list("clip_vision") + folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/clip_vision'"}),
                  "precision": (["fp16", "fp32", "bf16"],
                     {"default": "fp16"}
                 ),
@@ -946,7 +963,7 @@ class LoadWanVideoClipTextEncoder:
     RETURN_NAMES = ("wan_clip_vision", )
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Wan text_encoder model from 'ComfyUI/models/text_encoders'"
+    DESCRIPTION = "Loads Wan clip_vision model from 'ComfyUI/models/clip_vision'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device"):
         from .wanvideo.modules.clip import CLIPModel
@@ -958,7 +975,10 @@ class LoadWanVideoClipTextEncoder:
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
-        model_path = folder_paths.get_full_path("text_encoders", model_name)
+        model_path = folder_paths.get_full_path("clip_vision", model_name)
+        # We also support legacy setups where the model is in the text_encoders folder
+        if model_path is None:
+            model_path = folder_paths.get_full_path("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
         if "log_scale" not in sd:
             raise ValueError("Invalid CLIP model, this node expectes the 'open-clip-xlm-roberta-large-vit-huge-14' model")
@@ -1314,9 +1334,8 @@ class WanVideoClipVisionEncode:
                     negative_clip_embeds = clip_vision.visual(pixel_values)
         log.info(f"Clip embeds shape: {clip_embeds.shape}")
 
-        
+        embed_1 = clip_embeds[0:1] * strength_1
         if clip_embeds.shape[0] > 1:
-            embed_1 = clip_embeds[0:1] * strength_1
             embed_2 = clip_embeds[1:2] * strength_2
             if combine_embeds == "average":
                 clip_embeds = torch.mean(torch.stack([embed_1, embed_2]), dim=0)
@@ -1394,7 +1413,11 @@ class WanVideoImageToVideoEncode:
             if end_image is not None:
                 mask[:, -end_image.shape[0]:] = 1  # End frame if exists
         else:
-            mask = temporal_mask[:base_frames, :lat_h, :lat_w]
+            mask = common_upscale(temporal_mask.unsqueeze(1).to(device), lat_w, lat_h, "nearest", "disabled").squeeze(1)
+            if mask.shape[0] > base_frames:
+                mask = mask[:base_frames]
+            elif mask.shape[0] < base_frames:
+                mask = torch.cat([mask, torch.zeros(base_frames - mask.shape[0], lat_h, lat_w, device=device)])
             mask = mask.unsqueeze(0).to(device)
 
         # Repeat first frame and optionally end frame
@@ -1441,6 +1464,7 @@ class WanVideoImageToVideoEncode:
                     zero_frames = torch.zeros(3, num_frames-1, H, W, device=device)
                 concatenated = torch.cat([resized_start_image.to(device), zero_frames, resized_end_image.to(device)], dim=1)
         else:
+            temporal_mask = common_upscale(temporal_mask.unsqueeze(1), W, H, "nearest", "disabled").squeeze(1)
             concatenated = resized_start_image[:,:num_frames] * temporal_mask[:num_frames].unsqueeze(0)
 
         y = vae.encode([concatenated.to(device=device, dtype=vae.dtype)], device, end_=(end_image is not None and not fun_model))[0]
@@ -1501,20 +1525,13 @@ class WanVideoEmptyEmbeds:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, num_frames, width, height, control_embeds=None):
-
-        patch_size = (1, 2, 2)
         vae_stride = (4, 8, 8)
 
         target_shape = (16, (num_frames - 1) // vae_stride[0] + 1,
                         height // vae_stride[1],
                         width // vae_stride[2])
-
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                            (patch_size[1] * patch_size[2]) *
-                            target_shape[1])
         
         embeds = {
-            "max_seq_len": seq_len,
             "target_shape": target_shape,
             "num_frames": num_frames,
             "control_embeds": control_embeds["control_embeds"] if control_embeds is not None else None,
@@ -1583,6 +1600,169 @@ class WanVideoSLG:
             "end_percent": end_percent,
         }
         return (slg_args,)
+
+#region VACE
+class WanVideoVACEEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "vae": ("WANVAE",),
+            "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+            "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001}),
+            "vace_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percent of the steps to apply VACE"}),
+            "vace_end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percent of the steps to apply VACE"}),
+            },
+            "optional": {
+                "input_frames": ("IMAGE",),
+                "ref_images": ("IMAGE",),
+                "input_masks": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", )
+    RETURN_NAMES = ("vace_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None):
+        
+        self.device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        self.vae = vae.to(self.device)
+        self.vae_stride = (4, 8, 8)
+
+        target_shape = (16, (num_frames - 1) // self.vae_stride[0] + 1,
+                        height // self.vae_stride[1],
+                        width // self.vae_stride[2])
+        # vace context encode
+        if input_frames is None:
+            input_frames = torch.zeros((1, 3, num_frames, height, width), device=self.device, dtype=self.vae.dtype)
+        else:
+            input_frames = input_frames[:num_frames]
+            input_frames = common_upscale(input_frames.clone().movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+            input_frames = input_frames.to(self.vae.dtype).to(self.device).unsqueeze(0).permute(0, 4, 1, 2, 3) # B, C, T, H, W
+            input_frames = input_frames * 2 - 1
+        if input_masks is None:
+            input_masks = torch.ones_like(input_frames, device=self.device)
+        else:
+            print("input_masks shape", input_masks.shape)
+            input_masks = input_masks[:num_frames]
+            input_masks = common_upscale(input_masks.clone().unsqueeze(1), width, height, "nearest-exact", "disabled").squeeze(1)
+            input_masks = input_masks.to(self.vae.dtype).to(self.device)
+            input_masks = input_masks.unsqueeze(-1).unsqueeze(0).permute(0, 4, 1, 2, 3).repeat(1, 3, 1, 1, 1) # B, C, T, H, W
+
+        if ref_images is not None:
+            # Create padded image
+            if ref_images.shape[0] > 1:
+                ref_images = torch.cat([ref_images[i] for i in range(ref_images.shape[0])], dim=1).unsqueeze(0)
+        
+            B, H, W, C = ref_images.shape
+            current_aspect = W / H
+            target_aspect = width / height
+            if current_aspect > target_aspect:
+                # Image is wider than target, pad height
+                new_h = int(W / target_aspect)
+                pad_h = (new_h - H) // 2
+                padded = torch.ones(ref_images.shape[0], new_h, W, ref_images.shape[3], device=ref_images.device, dtype=ref_images.dtype)
+                padded[:, pad_h:pad_h+H, :, :] = ref_images
+                ref_images = padded
+            elif current_aspect < target_aspect:
+                # Image is taller than target, pad width
+                new_w = int(H * target_aspect)
+                pad_w = (new_w - W) // 2
+                padded = torch.ones(ref_images.shape[0], H, new_w, ref_images.shape[3], device=ref_images.device, dtype=ref_images.dtype)
+                padded[:, :, pad_w:pad_w+W, :] = ref_images
+                ref_images = padded
+            ref_images = common_upscale(ref_images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+            
+            ref_images = ref_images.to(self.vae.dtype).to(self.device).unsqueeze(0).permute(0, 4, 1, 2, 3).unsqueeze(0)
+            ref_images = ref_images * 2 - 1
+      
+        z0 = self.vace_encode_frames(input_frames, ref_images, masks=input_masks)
+        self.vae.model.clear_cache()
+        m0 = self.vace_encode_masks(input_masks, ref_images)
+        self.vae.model.clear_cache()
+        z = self.vace_latent(z0, m0)
+
+        self.vae.to(offload_device)
+
+        vace_input = {
+            "vace_context": z,
+            "vace_scale": strength,
+            "has_ref": ref_images is not None,
+            "num_frames": num_frames,
+            "target_shape": target_shape,
+            "vace_start_percent": vace_start_percent,
+            "vace_end_percent": vace_end_percent,
+        }
+    
+        return (vace_input,)
+    def vace_encode_frames(self, frames, ref_images, masks=None):
+        if ref_images is None:
+            ref_images = [None] * len(frames)
+        else:
+            assert len(frames) == len(ref_images)
+
+        if masks is None:
+            latents = self.vae.encode(frames, self.device)
+        else:
+            inactive = [i * (1 - m) + 0 * m for i, m in zip(frames, masks)]
+            reactive = [i * m + 0 * (1 - m) for i, m in zip(frames, masks)]
+            inactive = self.vae.encode(inactive, self.device)
+            reactive = self.vae.encode(reactive, self.device)
+            latents = [torch.cat((u, c), dim=0) for u, c in zip(inactive, reactive)]
+        self.vae.model.clear_cache()
+        cat_latents = []
+        for latent, refs in zip(latents, ref_images):
+            if refs is not None:
+                if masks is None:
+                    ref_latent = self.vae.encode(refs, self.device)
+                else:
+                    print("refs shape", refs.shape)#torch.Size([3, 1, 512, 512])
+                    ref_latent = self.vae.encode(refs, self.device)
+                    ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
+                assert all([x.shape[1] == 1 for x in ref_latent])
+                latent = torch.cat([*ref_latent, latent], dim=1)
+            cat_latents.append(latent)
+        return cat_latents
+
+    def vace_encode_masks(self, masks, ref_images=None):
+        if ref_images is None:
+            ref_images = [None] * len(masks)
+        else:
+            assert len(masks) == len(ref_images)
+
+        result_masks = []
+        for mask, refs in zip(masks, ref_images):
+            c, depth, height, width = mask.shape
+            new_depth = int((depth + 3) // self.vae_stride[0])
+            height = 2 * (int(height) // (self.vae_stride[1] * 2))
+            width = 2 * (int(width) // (self.vae_stride[2] * 2))
+
+            # reshape
+            mask = mask[0, :, :, :]
+            mask = mask.view(
+                depth, height, self.vae_stride[1], width, self.vae_stride[1]
+            )  # depth, height, 8, width, 8
+            mask = mask.permute(2, 4, 0, 1, 3)  # 8, 8, depth, height, width
+            mask = mask.reshape(
+                self.vae_stride[1] * self.vae_stride[2], depth, height, width
+            )  # 8*8, depth, height, width
+
+            # interpolation
+            mask = F.interpolate(mask.unsqueeze(0), size=(new_depth, height, width), mode='nearest-exact').squeeze(0)
+
+            if refs is not None:
+                length = len(refs)
+                mask_pad = torch.zeros_like(mask[:, :length, :, :])
+                mask = torch.cat((mask_pad, mask), dim=1)
+            result_masks.append(mask)
+        return result_masks
+
+    def vace_latent(self, z, m):
+        return [torch.cat([zz, mm], dim=0) for zz, mm in zip(z, m)]
 
 
 #region Sampler
@@ -1761,12 +1941,16 @@ class WanVideoSampler:
             "use_dynamic_shifting": False,
         }
 
+        timesteps = None
         if scheduler == 'unipc':
             sample_scheduler = FlowUniPCMultistepScheduler(**scheduler_args)
             sample_scheduler.set_timesteps(steps, device=device, shift=shift)
         elif scheduler in ['euler/beta', 'euler']:
             sample_scheduler = FlowMatchEulerDiscreteScheduler(**scheduler_args, use_beta_sigmas=(scheduler == 'euler/beta'))
-            sample_scheduler.set_timesteps(steps, device=device, mu=1)  
+            if flowedit_args: #seems to work better
+                timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=get_sampling_sigmas(steps, shift))
+            else:
+                sample_scheduler.set_timesteps(steps, device=device, mu=1)  
         elif 'dpm++' in scheduler:
             if scheduler == 'dpm++_sde':
                 algorithm_type = "sde-dpmsolver++"
@@ -1774,7 +1958,9 @@ class WanVideoSampler:
                 algorithm_type = "dpmsolver++"
             sample_scheduler = FlowDPMSolverMultistepScheduler(**scheduler_args, algorithm_type= algorithm_type)
             sample_scheduler.set_timesteps(steps, device=device, mu=1)
-        timesteps = sample_scheduler.timesteps
+        
+        if timesteps is None:
+            timesteps = sample_scheduler.timesteps
         
         if denoise_strength < 1.0:
             steps = int(steps * denoise_strength)
@@ -1784,7 +1970,8 @@ class WanVideoSampler:
         seed_g.manual_seed(seed)
        
         control_latents, clip_fea, clip_fea_neg, end_image = None, None, None, None
-        fun_model = False
+        vace_context, vace_scale = None, None
+        fun_model, has_ref = False, False
 
         image_cond = image_embeds.get("image_embeds", None)
        
@@ -1820,15 +2007,23 @@ class WanVideoSampler:
             target_shape = image_embeds.get("target_shape", None)
             if target_shape is None:
                 raise ValueError("Empty image embeds must be provided for T2V (Text to Video")
-            seq_len = image_embeds["max_seq_len"]
+            
+            has_ref = image_embeds.get("has_ref", False)
+            vace_context = image_embeds.get("vace_context", None)
+            vace_scale = image_embeds.get("vace_scale", None)
+            vace_start_percent = image_embeds.get("vace_start_percent", 0.0)
+            vace_end_percent = image_embeds.get("vace_end_percent", 1.0)
+
             noise = torch.randn(
                     target_shape[0],
-                    target_shape[1],
+                    target_shape[1] + 1 if has_ref else target_shape[1],
                     target_shape[2],
                     target_shape[3],
                     dtype=torch.float32,
                     device=torch.device("cpu"),
                     generator=seed_g)
+            
+            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
             
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
@@ -1977,6 +2172,7 @@ class WanVideoSampler:
                 block_swap_args["blocks_to_swap"] - 1 ,
                 block_swap_args["offload_txt_emb"],
                 block_swap_args["offload_img_emb"],
+                vace_blocks_to_swap = block_swap_args.get("vace_blocks_to_swap", None),
             )
 
         elif model["auto_cpu_offload"]:
@@ -2010,6 +2206,7 @@ class WanVideoSampler:
             transformer.teacache_end_step = len(timesteps)-1 if teacache_args["end_step"] == -1 else teacache_args["end_step"]
             transformer.teacache_use_coefficients = teacache_args["use_coefficients"]
             transformer.teacache_mode = teacache_args["mode"]
+            transformer.teacache_state.clear_all()
         else:
             transformer.enable_teacache = False
 
@@ -2028,24 +2225,6 @@ class WanVideoSampler:
         self.teacache_state = [None, None]
         self.teacache_state_source = [None, None]
         self.teacache_states_context = []
-
-
-        # if "sparge" in transformer.attention_mode:
-        #     from spas_sage_attn.autotune import (
-        #         SparseAttentionMeansim,
-        #         extract_sparse_attention_state_dict,
-        #         load_sparse_attention_state_dict,
-        #     )
-                
-        #     for idx, block in enumerate(transformer.blocks):
-        #         block.self_attn.verbose = True
-        #         block.self_attn.inner_attention = SparseAttentionMeansim(l1=0.06, pv_l1=0.065)
-        #     if transformer.attention_mode == "spargeattn":
-        #         try:
-        #             saved_state_dict = torch.load("sparge_wan.pt")
-        #         except:
-        #             raise ValueError("No saved parameters found for sparse attention, tuning is required first")
-        #         load_sparse_attention_state_dict(transformer, saved_state_dict, verbose = True)
 
         if flowedit_args is not None:
             source_embeds = flowedit_args["source_embeds"]
@@ -2091,7 +2270,8 @@ class WanVideoSampler:
             use_cfg_zero_star = experimental_args.get("cfg_zero_star", False)
             zero_star_steps = experimental_args.get("zero_star_steps", 0)
 
-        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, teacache_state=None):
+        #region model pred
+        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, vace_context=None, teacache_state=None):
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=model["dtype"], enabled=True):
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
@@ -2128,6 +2308,12 @@ class WanVideoSampler:
                                 patcher.model.is_patched = True
                 else:
                     image_cond_input = image_cond
+
+                if vace_context is not None:
+                    vace_context_input = vace_context
+                    if not (vace_start_percent <= current_step_percentage <= vace_end_percent) or \
+                            (vace_end_percent > 0 and idx == 0 and current_step_percentage >= vace_start_percent):
+                        vace_context_input = None
     
                 base_params = {
                     'seq_len': seq_len,
@@ -2137,6 +2323,8 @@ class WanVideoSampler:
                     'current_step': idx,
                     'y': [image_cond_input] if image_cond_input is not None else None,
                     'control_lora_enabled': control_lora_enabled,
+                    'vace_context': vace_context_input if vace_context is not None else None,
+                    'vace_scale': vace_scale,
                 }
 
                 batch_size = 1
@@ -2426,14 +2614,19 @@ class WanVideoSampler:
                                     partial_img_emb[:, 0, :, :] =  torch.cat([image[0][:,0,:,:], mask], dim=0)
                             else:
                                 partial_img_emb[:, 0, :, :] =  partial_image_cond
-                      
+                    
+                    partial_vace_context = None
+                    if vace_context is not None:
+                        partial_vace_context = vace_context[0][:, c, :, :]
+                        if has_ref:
+                            partial_vace_context[:, 0, :, :] = vace_context[0][:, 0, :, :]
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
                     noise_pred_context, new_teacache = predict_with_cfg(
                         partial_latent_model_input, 
                         cfg[idx], positive, 
                         text_embeds["negative_prompt_embeds"], 
-                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents,
+                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, [partial_vace_context],
                         current_teacache)
 
                     # if callback is not None:
@@ -2456,7 +2649,7 @@ class WanVideoSampler:
                     cfg[idx], 
                     text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
-                    timestep, idx, image_cond, clip_fea, control_latents,
+                    timestep, idx, image_cond, clip_fea, control_latents, vace_context,
                     teacache_state=self.teacache_state)
 
             if latent_shift_loop:
@@ -2521,7 +2714,7 @@ class WanVideoSampler:
             pass
 
         return ({
-            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped, "end_image": end_image if not fun_model else None
+            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped, "end_image": end_image if not fun_model else None, "has_ref": has_ref 
             }, )
     
 class WindowTracker:
@@ -2588,6 +2781,8 @@ class WanVideoDecode:
         mm.soft_empty_cache()
         latents = samples["samples"]
         end_image = samples.get("end_image", None)
+        has_ref = samples.get("has_ref", False)
+        is_looped = samples.get("looped", False)
 
         vae.to(device)
 
@@ -2595,8 +2790,9 @@ class WanVideoDecode:
 
         mm.soft_empty_cache()
 
-        is_looped = samples.get("looped", False)
-        warmup_latent_count = 3
+        
+        if has_ref:
+            latents = latents[:, :, 1:]
 
         #if is_looped:
         #   latents = torch.cat([latents[:, :, :warmup_latent_count],latents], dim=2)
@@ -2704,85 +2900,6 @@ class WanVideoEncode:
  
         return ({"samples": latents, "mask": latent_mask},)
 
-class WanVideoLatentPreview:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "samples": ("LATENT",),
-                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                 "min_val": ("FLOAT", {"default": -0.15, "min": -1.0, "max": 0.0, "step": 0.0001}),
-                 "max_val": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.0001}),
-                 "r_bias": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.0001}),
-                 "g_bias": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.0001}),
-                 "b_bias": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.0001}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING", )
-    RETURN_NAMES = ("images", "latent_rgb_factors",)
-    FUNCTION = "sample"
-    CATEGORY = "WanVideoWrapper"
-
-    def sample(self, samples, seed, min_val, max_val, r_bias, g_bias, b_bias):
-        mm.soft_empty_cache()
-
-        latents = samples["samples"].clone()
-        print("in sample", latents.shape)
-        #latent_rgb_factors =[[-0.02531045419704009, -0.00504800612542497, 0.13293717293982546], [-0.03421835830845858, 0.13996708548892614, -0.07081038680118075], [0.011091819063647063, -0.03372949685846012, -0.0698232210116172], [-0.06276524604742019, -0.09322986677909442, 0.01826383612148913], [0.021290659938126788, -0.07719530444034409, -0.08247812477766273], [0.04401102991215147, -0.0026401932105894754, -0.01410913586718443], [0.08979717602613707, 0.05361221258740831, 0.11501425309699129], [0.04695121980405198, -0.13053491609675175, 0.05025986885867986], [-0.09704684176098193, 0.03397687417738002, -0.1105886644677771], [0.14694697234804935, -0.12316902186157716, 0.04210404546699645], [0.14432470831243552, -0.002580008133591355, -0.08490676947390643], [0.051502750076553944, -0.10071695490292451, -0.01786223610178095], [-0.12503276881774464, 0.08877830923879379, 0.1076584501927316], [-0.020191205513213406, -0.1493425056303128, -0.14289740371758308], [-0.06470138952271293, -0.07410426095060325, 0.00980804676890873], [0.11747671720735695, 0.10916082743849789, -0.12235599365235904]]
-        latent_rgb_factors = [
-        [0.000159, -0.000223, 0.001299],
-        [0.000566, 0.000786, 0.001948],
-        [0.001531, -0.000337, 0.000863],
-        [0.001887, 0.002190, 0.002117],
-        [0.002032, 0.000782, -0.000512],
-        [0.001634, 0.001260, 0.001685],
-        [0.001360, -0.000292, 0.000189],
-        [0.001410, 0.000769, 0.001935],
-        [-0.000365, 0.000211, 0.000397],
-        [-0.000091, 0.001333, 0.001812],
-        [0.000201, 0.001866, 0.000546],
-        [0.001889, 0.000544, -0.000237],
-        [0.001779, 0.000022, 0.001764],
-        [0.001456, 0.000431, 0.001574],
-        [0.001791, 0.001738, -0.000121],
-        [-0.000034, -0.000405, 0.000708]
-    ]
-
-        import random
-        random.seed(seed)
-        #latent_rgb_factors = [[random.uniform(min_val, max_val) for _ in range(3)] for _ in range(16)]
-        #latent_rgb_factors = [[0.1 for _ in range(3)] for _ in range(16)]
-        out_factors = latent_rgb_factors
-        print(latent_rgb_factors)
-
-        latent_rgb_factors_bias = [-0.0011, 0.0, -0.0002]
-        #latent_rgb_factors_bias = [r_bias, g_bias, b_bias]
-
-        latent_rgb_factors = torch.tensor(latent_rgb_factors, device=latents.device, dtype=latents.dtype).transpose(0, 1)
-        latent_rgb_factors_bias = torch.tensor(latent_rgb_factors_bias, device=latents.device, dtype=latents.dtype)
-        print(latent_rgb_factors)
-
-        print("latent_rgb_factors", latent_rgb_factors.shape)
-
-        latent_images = []
-        for t in range(latents.shape[2]):
-            latent = latents[:, :, t, :, :]
-            latent = latent[0].permute(1, 2, 0)
-            latent_image = torch.nn.functional.linear(
-                latent,
-                latent_rgb_factors,
-                bias=latent_rgb_factors_bias
-            )
-            latent_images.append(latent_image)
-        latent_images = torch.stack(latent_images, dim=0)
-        print("latent_images", latent_images.shape)
-        latent_images_min = latent_images.min()
-        latent_images_max = latent_images.max()
-        latent_images = (latent_images - latent_images_min) / (latent_images_max - latent_images_min)
-
-        return (latent_images.float().cpu(), out_factors)
-
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -2797,7 +2914,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoEncode": WanVideoEncode,
     "WanVideoBlockSwap": WanVideoBlockSwap,
     "WanVideoTorchCompileSettings": WanVideoTorchCompileSettings,
-    "WanVideoLatentPreview": WanVideoLatentPreview,
     "WanVideoEmptyEmbeds": WanVideoEmptyEmbeds,
     "WanVideoLoraSelect": WanVideoLoraSelect,
     "WanVideoLoraBlockEdit": WanVideoLoraBlockEdit,
@@ -2814,6 +2930,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoImageResizeToClosest": WanVideoImageResizeToClosest,
     "WanVideoSetBlockSwap": WanVideoSetBlockSwap,
     "WanVideoExperimentalArgs": WanVideoExperimentalArgs,
+    "WanVideoVACEEncode": WanVideoVACEEncode,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -2830,7 +2947,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoEncode": "WanVideo Encode",
     "WanVideoBlockSwap": "WanVideo BlockSwap",
     "WanVideoTorchCompileSettings": "WanVideo Torch Compile Settings",
-    "WanVideoLatentPreview": "WanVideo Latent Preview",
     "WanVideoEmptyEmbeds": "WanVideo Empty Embeds",
     "WanVideoLoraSelect": "WanVideo Lora Select",
     "WanVideoLoraBlockEdit": "WanVideo Lora Block Edit",
@@ -2847,4 +2963,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoImageResizeToClosest": "WanVideo Image Resize To Closest",
     "WanVideoSetBlockSwap": "WanVideo Set BlockSwap",
     "WanVideoExperimentalArgs": "WanVideo Experimental Args",
+    "WanVideoVACEEncode": "WanVideo VACE Encode",
     }

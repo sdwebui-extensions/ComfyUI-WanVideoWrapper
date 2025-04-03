@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import repeat
+from einops import repeat, rearrange
 from ...enhance_a_video.enhance import get_feta_scores
 from ...enhance_a_video.globals import is_enhance_enabled
 
@@ -21,7 +21,6 @@ from ...utils import log, get_module_memory_mb
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 
 def rope_riflex(pos, dim, theta, L_test, k, temporal):
-    from einops import rearrange
     assert dim % 2 == 0
     if mm.is_device_mps(pos.device) or mm.is_intel_xpu() or mm.is_directml_enabled():
         device = torch.device("cpu")
@@ -209,27 +208,6 @@ class WanSelfAttention(nn.Module):
         # x = self.o(x)
         # return x
 
-        # if self.attention_mode == 'spargeattn_tune' or self.attention_mode == 'spargeattn':
-        #     tune_mode = False
-        #     if self.attention_mode == 'spargeattn_tune':
-        #         tune_mode = True
-                
-        #     if hasattr(self, 'inner_attention'):
-        #         #print("has inner attention")
-        #         q=rope_apply(q, grid_sizes, freqs)
-        #         k=rope_apply(k, grid_sizes, freqs)
-        #         q = q.permute(0, 2, 1, 3)
-        #         k = k.permute(0, 2, 1, 3)
-        #         v = v.permute(0, 2, 1, 3)
-        #         x = self.inner_attention(
-        #             q=q, 
-        #             k=k,
-        #             v=v, 
-        #             is_causal=False, 
-        #             tune_mode=tune_mode
-        #             ).permute(0, 2, 1, 3)
-        #         #print("inner attention", x.shape) #inner attention torch.Size([1, 12, 32760, 128])
-        #else:
         if rope_func == "comfy":
             q, k = apply_rope_comfy(q, k, freqs)
         else:
@@ -238,7 +216,8 @@ class WanSelfAttention(nn.Module):
 
         if is_enhance_enabled():
             feta_scores = get_feta_scores(q, k)
-        # Split by frames
+
+        # Split by frames if multiple prompts are provided
         if seq_chunks > 1 and current_step in video_attention_split_steps:
             outputs = []
             # Extract frame, height, width from grid_sizes - force to CPU scalars
@@ -530,8 +509,70 @@ class WanAttentionBlock(nn.Module):
                 return x
 
         x = cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+
         return x
 
+class VaceWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+            self,
+            cross_attn_type,
+            dim,
+            ffn_dim,
+            num_heads,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=False,
+            eps=1e-6,
+            block_id=0
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
+        self.block_id = block_id
+        if block_id == 0:
+            self.before_proj = nn.Linear(self.dim, self.dim)
+            nn.init.zeros_(self.before_proj.weight)
+            nn.init.zeros_(self.before_proj.bias)
+        self.after_proj = nn.Linear(self.dim, self.dim)
+        nn.init.zeros_(self.after_proj.weight)
+        nn.init.zeros_(self.after_proj.bias)
+
+    def forward(self, c, x, **kwargs):
+        if self.block_id == 0:
+            c = self.before_proj(c) + x
+            all_c = []
+        else:
+            all_c = list(torch.unbind(c))
+            c = all_c.pop(-1)
+        c = super().forward(c, **kwargs)
+        c_skip = self.after_proj(c)
+        all_c += [c_skip, c]
+        c = torch.stack(all_c)
+        return c
+
+class BaseWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+        self,
+        cross_attn_type,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        block_id=None,
+        attention_mode='sdpa'
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, attention_mode)
+        self.block_id = block_id
+
+    def forward(self, x, vace_hints=None, vace_context_scale=1.0, **kwargs):
+        x = super().forward(x, **kwargs)
+        if vace_hints is None:
+            return x
+        
+        if self.block_id is not None:
+            x = x + vace_hints[self.block_id].to(x.device) * vace_context_scale
+        return x
 
 class Head(nn.Module):
 
@@ -609,7 +650,10 @@ class WanModel(ModelMixin, ConfigMixin):
                  attention_mode='sdpa',
                  main_device=torch.device('cuda'),
                  offload_device=torch.device('cpu'),
-                 teacache_coefficients=[],):
+                 teacache_coefficients=[],
+                 vace_layers=None,
+                 vace_in_dim=None
+                 ):
         r"""
         Initialize the diffusion model backbone.
 
@@ -672,6 +716,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.blocks_to_swap = -1
         self.offload_txt_emb = False
         self.offload_img_emb = False
+        self.vace_blocks_to_swap = -1
 
         #init TeaCache variables
         self.enable_teacache = False
@@ -707,17 +752,43 @@ class WanModel(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
-        # blocks
-        cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        self.blocks = nn.ModuleList([
-            WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+        if vace_layers is not None:
+            self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
+            self.vace_in_dim = self.in_dim if vace_in_dim is None else vace_in_dim
+
+            self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
+
+            # vace blocks
+            self.vace_blocks = nn.ModuleList([
+                VaceWanAttentionBlock('t2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm,
+                                        self.cross_attn_norm, self.eps, block_id=i)
+                for i in self.vace_layers
+            ])
+
+            # vace patch embeddings
+            self.vace_patch_embedding = nn.Conv3d(
+                self.vace_in_dim, self.dim, kernel_size=self.patch_size, stride=self.patch_size
+            )
+            self.blocks = nn.ModuleList([
+            BaseWanAttentionBlock('t2v_cross_attn', dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps,
-                              attention_mode=self.attention_mode)
-            for _ in range(num_layers)
-        ])
+                              attention_mode=self.attention_mode,
+                              block_id=self.vace_layers_mapping[i] if i in self.vace_layers else None)
+            for i in range(num_layers)
+            ])
+        else:
+            # blocks
+            cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+            self.blocks = nn.ModuleList([
+                WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+                                window_size, qk_norm, cross_attn_norm, eps,
+                                attention_mode=self.attention_mode)
+                for _ in range(num_layers)
+            ])
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
+        
 
         d = self.dim // self.num_heads
         self.rope_embedder = EmbedND_RifleX(
@@ -735,9 +806,10 @@ class WanModel(ModelMixin, ConfigMixin):
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
 
-    def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False):
+    def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False, vace_blocks_to_swap=None):
         print(f"Swapping {blocks_to_swap + 1} transformer blocks")
         self.blocks_to_swap = blocks_to_swap
+        
         self.offload_img_emb = offload_img_emb
         self.offload_txt_emb = offload_txt_emb
 
@@ -754,6 +826,19 @@ class WanModel(ModelMixin, ConfigMixin):
                 block.to(self.offload_device, non_blocking=self.use_non_blocking)
                 total_offload_memory += block_memory
 
+        if vace_blocks_to_swap > 0 and self.vace_layers is not None:
+            self.vace_blocks_to_swap = vace_blocks_to_swap
+
+            for b, block in tqdm(enumerate(self.vace_blocks), total=len(self.vace_blocks), desc="Initializing vace block swap"):
+                block_memory = get_module_memory_mb(block)
+                
+                if b > self.vace_blocks_to_swap:
+                    block.to(self.main_device)
+                    total_main_memory += block_memory
+                else:
+                    block.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    total_offload_memory += block_memory
+
         mm.soft_empty_cache()
         gc.collect()
 
@@ -764,6 +849,39 @@ class WanModel(ModelMixin, ConfigMixin):
         log.info(f"Total memory used by transformer blocks: {(total_offload_memory + total_main_memory):.2f}MB")
         log.info(f"Non-blocking memory transfer: {self.use_non_blocking}")
         log.info("----------------------")
+
+    def forward_vace(
+        self,
+        x,
+        vace_context,
+        seq_len,
+        kwargs
+    ):
+        # embeddings
+        c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+        c = [u.flatten(2).transpose(1, 2) for u in c]
+        c = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in c
+        ])
+
+        # arguments
+        new_kwargs = dict(x=x)
+        new_kwargs.update(kwargs)
+
+        for b, block in enumerate(self.vace_blocks):
+            if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
+                block.to(self.main_device)
+            c = block(c, **new_kwargs)
+            if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
+                block.to(self.offload_device, non_blocking=self.use_non_blocking)
+
+        #for block in self.vace_blocks:
+        #    c = block(c, **new_kwargs)
+        hints = torch.unbind(c)[:-1]
+        if self.vace_blocks_to_swap != -1:
+            hints = [h.to(self.offload_device) for h in hints] 
+        return hints
 
     def forward(
         self,
@@ -780,6 +898,9 @@ class WanModel(ModelMixin, ConfigMixin):
         current_step=0,
         pred_id=None,
         control_lora_enabled=False,
+        vace_context = None,
+        vace_scale=1.0,
+
     ):
         r"""
         Forward pass through the diffusion model
@@ -923,7 +1044,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if not self.enable_teacache or (self.enable_teacache and should_calc):
             if self.enable_teacache:
-                original_x = x.clone()
+                original_x = x.clone().to(self.teacache_cache_device)
+
             # arguments
             kwargs = dict(
                 e=e0,
@@ -935,8 +1057,14 @@ class WanModel(ModelMixin, ConfigMixin):
                 clip_embed=clip_embed,
                 rope_func=rope_func,
                 current_step=current_step,
-                video_attention_split_steps=self.video_attention_split_steps,
+                video_attention_split_steps=self.video_attention_split_steps
                 )
+            
+            if vace_context is not None:
+                vace_hints = self.forward_vace(x, vace_context, seq_len, kwargs)
+                vace_context_scale = vace_scale
+                kwargs['vace_hints'] = vace_hints
+                kwargs['vace_context_scale'] = vace_context_scale
 
             for b, block in enumerate(self.blocks):
                 if self.slg_blocks is not None:
@@ -956,9 +1084,9 @@ class WanModel(ModelMixin, ConfigMixin):
             if self.enable_teacache and pred_id is not None:
                 self.teacache_state.update(
                     pred_id,
-                    previous_residual=(x - original_x),
-                    accumulated_rel_l1_distance=accumulated_rel_l1_distance,
-                    previous_modulated_input=previous_modulated_input
+                    previous_residual=(x.to(original_x.device) - original_x),
+                    accumulated_rel_l1_distance=accumulated_rel_l1_distance.to(self.teacache_cache_device),
+                    previous_modulated_input=previous_modulated_input.to(self.teacache_cache_device)
                 )
 
         # head
@@ -1017,8 +1145,6 @@ class TeaCacheState:
         if pred_id not in self.states:
             return None
         for key, value in kwargs.items():
-            if isinstance(value, torch.Tensor):
-                value = value.to(self.cache_device)
             self.states[pred_id][key] = value
     
     def get(self, pred_id):
