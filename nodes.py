@@ -458,7 +458,7 @@ class WanVideoModelLoader:
             },
         }
         if model_type == "i2v":
-            if "480" in model or "fun" in model.lower() or "a2" in model.lower(): #just a guess for the Fun model for now...
+            if "480" in model or "fun" in model.lower() or "a2" in model.lower() or 'swa' in model.lower(): #just a guess for the Fun model for now...
                 model_variant = "i2v_480"
             elif "720" in model:
                 model_variant = "i2v_720"
@@ -467,6 +467,9 @@ class WanVideoModelLoader:
         if dim == 1536:
             model_variant = "1_3B"
         log.info(f"Model variant detected: {model_variant}")
+        swa = False
+        if 'swa' in model.lower():
+            swa = True
         
         TRANSFORMER_CONFIG= {
             "dim": dim,
@@ -484,7 +487,8 @@ class WanVideoModelLoader:
             "offload_device": offload_device,
             "teacache_coefficients": teacache_coefficients_map[model_variant],
             "vace_layers": vace_layers,
-            "vace_in_dim": vace_in_dim
+            "vace_in_dim": vace_in_dim,
+            "swa": swa
         }
 
         with init_empty_weights():

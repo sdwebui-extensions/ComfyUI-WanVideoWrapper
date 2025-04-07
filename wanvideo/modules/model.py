@@ -161,7 +161,9 @@ class WanSelfAttention(nn.Module):
                  window_size=(-1, -1),
                  qk_norm=True,
                  eps=1e-6,
-                 attention_mode='sdpa'):
+                 attention_mode='sdpa',
+                 swa=False,
+                 bidx=0):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -171,6 +173,8 @@ class WanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.attention_mode = attention_mode
+        self.swa = swa
+        self.bidx = bidx
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -198,15 +202,16 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-        # x = swa_flash_attention(
-        #     rope_apply(q, grid_sizes, freqs),
-        #     rope_apply(k, grid_sizes, freqs),
-        #     v,
-        #     grid_sizes
-        # )
-        # x = x.flatten(2)
-        # x = self.o(x)
-        # return x
+        if self.swa and (self.bidx + 1) % 5 != 0:
+            x = swa_flash_attention(
+                rope_apply(q, grid_sizes, freqs),
+                rope_apply(k, grid_sizes, freqs),
+                v,
+                grid_sizes
+            )
+            x = x.flatten(2)
+            x = self.o(x)
+            return x
 
         if rope_func == "comfy":
             q, k = apply_rope_comfy(q, k, freqs)
@@ -374,7 +379,9 @@ class WanAttentionBlock(nn.Module):
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6,
-                 attention_mode='sdpa'):
+                 attention_mode='sdpa',
+                 swa=False,
+                 bidx=0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -388,7 +395,7 @@ class WanAttentionBlock(nn.Module):
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
-                                          eps, self.attention_mode)
+                                          eps, self.attention_mode, swa=swa, bidx=bidx)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -654,7 +661,8 @@ class WanModel(ModelMixin, ConfigMixin):
                  offload_device=torch.device('cpu'),
                  teacache_coefficients=[],
                  vace_layers=None,
-                 vace_in_dim=None
+                 vace_in_dim=None,
+                 swa=False,
                  ):
         r"""
         Initialize the diffusion model backbone.
@@ -784,7 +792,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.blocks = nn.ModuleList([
                 WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                 window_size, qk_norm, cross_attn_norm, eps,
-                                attention_mode=self.attention_mode)
+                                attention_mode=self.attention_mode, swa=swa, bidx=_)
                 for _ in range(num_layers)
             ])
 
