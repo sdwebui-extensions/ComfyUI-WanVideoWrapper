@@ -47,7 +47,7 @@ def swa_flash_attention(query, key, value, grid_sizes, windows_size=4096):
     num_frames, height, width = grid_sizes[0][0], grid_sizes[0][1], grid_sizes[0][2]
     query = rearrange(query.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
     key = rearrange(key.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
-    value = value(query.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
+    value = rearrange(value.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
     hidden_states = flash_attn_func(query, key, value, dropout_p=0.0, causal=False, window_size=(windows_size, windows_size))
     return hidden_states.to(out_dtype)
 
