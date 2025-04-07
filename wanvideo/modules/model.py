@@ -535,18 +535,19 @@ class VaceWanAttentionBlock(WanAttentionBlock):
         nn.init.zeros_(self.after_proj.weight)
         nn.init.zeros_(self.after_proj.bias)
 
-    def forward(self, c, x, **kwargs):
+    def forward(self, c_list, x, intermediate_device=None, nonblocking=True, **kwargs):
         if self.block_id == 0:
-            c = self.before_proj(c) + x
+            c = self.before_proj(c_list[0]) + x
             all_c = []
         else:
-            all_c = list(torch.unbind(c))
+            all_c = c_list
             c = all_c.pop(-1)
         c = super().forward(c, **kwargs)
         c_skip = self.after_proj(c)
-        all_c += [c_skip, c]
-        c = torch.stack(all_c)
-        return c
+
+        all_c += [c_skip.to(intermediate_device, non_blocking=nonblocking), c]
+        
+        return all_c
 
 class BaseWanAttentionBlock(WanAttentionBlock):
     def __init__(
@@ -565,13 +566,14 @@ class BaseWanAttentionBlock(WanAttentionBlock):
         super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, attention_mode)
         self.block_id = block_id
 
-    def forward(self, x, vace_hints=None, vace_context_scale=1.0, **kwargs):
+    def forward(self, x, vace_hints=None, vace_context_scale=[1.0], **kwargs):
         x = super().forward(x, **kwargs)
         if vace_hints is None:
             return x
         
         if self.block_id is not None:
-            x = x + vace_hints[self.block_id].to(x.device) * vace_context_scale
+            for i in range(len(vace_hints)):
+                x = x + vace_hints[i][self.block_id].to(x.device) * vace_context_scale[i]
         return x
 
 class Head(nn.Module):
@@ -826,6 +828,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 block.to(self.offload_device, non_blocking=self.use_non_blocking)
                 total_offload_memory += block_memory
 
+        if blocks_to_swap != -1 and vace_blocks_to_swap == 0:
+            vace_blocks_to_swap = 1
+
         if vace_blocks_to_swap > 0 and self.vace_layers is not None:
             self.vace_blocks_to_swap = vace_blocks_to_swap
 
@@ -864,23 +869,21 @@ class WanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in c
         ])
-
-        # arguments
-        new_kwargs = dict(x=x)
-        new_kwargs.update(kwargs)
-
+        
+        c_list = [c]
         for b, block in enumerate(self.vace_blocks):
             if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
                 block.to(self.main_device)
-            c = block(c, **new_kwargs)
+            c_list = block(
+                c_list, x, 
+                intermediate_device=self.offload_device if self.vace_blocks_to_swap != -1 else self.main_device, 
+                nonblocking=self.use_non_blocking,
+                **kwargs)
             if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
                 block.to(self.offload_device, non_blocking=self.use_non_blocking)
 
-        #for block in self.vace_blocks:
-        #    c = block(c, **new_kwargs)
-        hints = torch.unbind(c)[:-1]
-        if self.vace_blocks_to_swap != -1:
-            hints = [h.to(self.offload_device) for h in hints] 
+        hints = c_list[:-1]
+        
         return hints
 
     def forward(
@@ -898,9 +901,7 @@ class WanModel(ModelMixin, ConfigMixin):
         current_step=0,
         pred_id=None,
         control_lora_enabled=False,
-        vace_context = None,
-        vace_scale=1.0,
-
+        vace_data = None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1060,11 +1061,24 @@ class WanModel(ModelMixin, ConfigMixin):
                 video_attention_split_steps=self.video_attention_split_steps
                 )
             
-            if vace_context is not None:
-                vace_hints = self.forward_vace(x, vace_context, seq_len, kwargs)
-                vace_context_scale = vace_scale
-                kwargs['vace_hints'] = vace_hints
-                kwargs['vace_context_scale'] = vace_context_scale
+            if vace_data is not None:
+                vace_hint_list = []
+                vace_scale_list = []
+                if isinstance(vace_data[0], dict):
+                    for data in vace_data:
+                        if (data["start"] <= current_step_percentage <= data["end"]) or \
+                            (data["end"] > 0 and current_step == 0 and current_step_percentage >= data["start"]):
+
+                            vace_hints = self.forward_vace(x, data["context"], seq_len, kwargs)
+                            vace_hint_list.append(vace_hints)
+                            vace_scale_list.append(data["scale"])
+                else:
+                    vace_hints = self.forward_vace(x, vace_data, seq_len, kwargs)
+                    vace_hint_list.append(vace_hints)
+                    vace_scale_list.append(1.0)
+                
+                kwargs['vace_hints'] = vace_hint_list
+                kwargs['vace_context_scale'] = vace_scale_list
 
             for b, block in enumerate(self.blocks):
                 if self.slg_blocks is not None:
@@ -1167,27 +1181,3 @@ def relative_l1_distance(last_tensor, current_tensor):
     norm = torch.abs(last_tensor).mean()
     relative_l1_distance = l1_distance / norm
     return relative_l1_distance.to(torch.float32).to(current_tensor.device)
-
-def normalize_values(values):
-    min_val = min(values)
-    max_val = max(values)
-    if max_val == min_val:
-        return [0.0] * len(values)
-    return [(x - min_val) / (max_val - min_val) for x in values]
-
-def rescale_differences(input_diffs, output_diffs):
-    """Polynomial fitting between input and output differences"""
-    poly_degree = 4
-    if len(input_diffs) < 2:
-        return input_diffs
-    
-    x = np.array([x.item() for x in input_diffs])
-    y = np.array([y.item() for y in output_diffs])
-    print("x ", x)
-    print("y ", y)
-    
-    # Fit polynomial
-    coeffs = np.polyfit(x, y, poly_degree)
-    
-    # Apply polynomial transformation
-    return np.polyval(coeffs, x)

@@ -273,6 +273,29 @@ class WanVideoLoraSelect:
 
         loras_list.append(lora)
         return (loras_list,)
+    
+class WanVideoVACEModelSelect:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vace_model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' VACE model to use when not using model that has it included"}),
+                "vace_blocks": ("STRING", {"default": "0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28", "multiline": True, "tooltip": "Blocks to apply VACE to, default is for 1.3B model"}),
+            },
+        }
+
+    RETURN_TYPES = ("VACEPATH",)
+    RETURN_NAMES = ("vace_model", )
+    FUNCTION = "getvacepath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "VACE model to use when not using model that has it included, loaded from 'ComfyUI/models/diffusion_models'"
+
+    def getvacepath(self, vace_model, vace_blocks):
+        vace_model = {
+            "path": folder_paths.get_full_path("diffusion_models", vace_model),
+            "blocks": [int(x.strip()) for x in vace_blocks.split(",")],
+        }
+        return (vace_model,)
 
 class WanVideoLoraBlockEdit:
     def __init__(self):
@@ -325,6 +348,7 @@ class WanVideoModelLoader:
                 "block_swap_args": ("BLOCKSWAPARGS", ),
                 "lora": ("WANVIDLORA", {"default": None}),
                 "vram_management_args": ("VRAM_MANAGEMENTARGS", {"default": None, "tooltip": "Alternative offloading method from DiffSynth-Studio, more aggressive in reducing memory use than block swapping, but can be slower"}),
+                "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
             }
         }
 
@@ -334,7 +358,7 @@ class WanVideoModelLoader:
     CATEGORY = "WanVideoWrapper"
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
-                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None):
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
         lora_low_mem_load = False
         if lora is not None:
@@ -377,7 +401,12 @@ class WanVideoModelLoader:
                 pass
 
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model)
+      
         sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+
+        if vace_model is not None:
+            vace_sd = load_torch_file(vace_model["path"], device=transformer_load_device, safe_load=True)
+            sd.update(vace_sd)
 
         first_key = next(iter(sd))
         if first_key.startswith("model.diffusion_model."):
@@ -386,7 +415,8 @@ class WanVideoModelLoader:
                 new_key = key.replace("model.diffusion_model.", "", 1)
                 new_sd[new_key] = value
             sd = new_sd
-
+        if not "patch_embedding.weight" in sd:
+            raise ValueError("Invalid WanVideo model selected")
         dim = sd["patch_embedding.weight"].shape[0]
         in_channels = sd["patch_embedding.weight"].shape[1]
         print("in_channels: ", in_channels)
@@ -401,7 +431,10 @@ class WanVideoModelLoader:
         vace_layers, vace_in_dim = None, None
         if "vace_blocks.0.after_proj.weight" in sd:
             model_type = "t2v"
-            vace_layers = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+            if vace_model is not None:
+                vace_layers = vace_model["blocks"]
+            else:
+                vace_layers = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
             vace_in_dim = 96
 
         log.info(f"Model type: {model_type}, num_heads: {num_heads}, num_layers: {num_layers}")
@@ -425,7 +458,7 @@ class WanVideoModelLoader:
             },
         }
         if model_type == "i2v":
-            if "480" in model or "fun" in model.lower(): #just a guess for the Fun model for now...
+            if "480" in model or "fun" in model.lower() or "a2" in model.lower(): #just a guess for the Fun model for now...
                 model_variant = "i2v_480"
             elif "720" in model:
                 model_variant = "i2v_720"
@@ -1339,20 +1372,29 @@ class WanVideoClipVisionEncode:
                     negative_clip_embeds = clip_vision.visual(pixel_values)
         log.info(f"Clip embeds shape: {clip_embeds.shape}")
 
-        embed_1 = clip_embeds[0:1] * strength_1
+        weighted_embeds = []
+        weighted_embeds.append(clip_embeds[0:1] * strength_1)
+
+        # Handle all additional embeddings
         if clip_embeds.shape[0] > 1:
-            embed_2 = clip_embeds[1:2] * strength_2
+            weighted_embeds.append(clip_embeds[1:2] * strength_2)
+            
+            if clip_embeds.shape[0] > 2:
+                for i in range(2, clip_embeds.shape[0]):
+                    weighted_embeds.append(clip_embeds[i:i+1])  # Add as-is without strength modifier
+            
+            # Combine all weighted embeddings
             if combine_embeds == "average":
-                clip_embeds = torch.mean(torch.stack([embed_1, embed_2]), dim=0)
+                clip_embeds = torch.mean(torch.stack(weighted_embeds), dim=0)
             elif combine_embeds == "sum":
-                clip_embeds = torch.sum(torch.stack([embed_1, embed_2]), dim=0)
+                clip_embeds = torch.sum(torch.stack(weighted_embeds), dim=0)
             elif combine_embeds == "concat":
-                clip_embeds = torch.cat([embed_1, embed_2], dim=1)
+                clip_embeds = torch.cat(weighted_embeds, dim=1)
             elif combine_embeds == "batch":
-                clip_embeds = torch.cat([embed_1, embed_2], dim=0)
+                clip_embeds = torch.cat(weighted_embeds, dim=0)
                 
 
-            log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
+        log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
         
         if force_offload:
             clip_vision.model.to(offload_device)
@@ -1385,6 +1427,7 @@ class WanVideoImageToVideoEncode:
                 "control_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Control signal for the Fun -model"}),
                 "fun_model": ("BOOLEAN", {"default": False, "tooltip": "Enable when using Fun model"}),
                 "temporal_mask": ("MASK", {"tooltip": "mask"}),
+                "extra_latents": ("LATENT", {"tooltip": "Extra latents to add to the input front, used for Skyreels A2 reference images"}),
             }
         }
 
@@ -1394,7 +1437,7 @@ class WanVideoImageToVideoEncode:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, width, height, num_frames, clip_embeds, force_offload, noise_aug_strength, 
-                start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_model=False, temporal_mask=None):
+                start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_model=False, temporal_mask=None, extra_latents=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1473,6 +1516,13 @@ class WanVideoImageToVideoEncode:
             concatenated = resized_start_image[:,:num_frames] * temporal_mask[:num_frames].unsqueeze(0)
 
         y = vae.encode([concatenated.to(device=device, dtype=vae.dtype)], device, end_=(end_image is not None and not fun_model))[0]
+        has_ref = False
+        if extra_latents is not None:
+            samples = extra_latents["samples"].squeeze(0)
+            y = torch.cat([samples, y], dim=1)
+            mask = torch.cat([torch.ones_like(mask[:, 0:samples.shape[1]]), mask], dim=1)
+            num_frames += samples.shape[1] * 4
+            has_ref = True
         y[:, :1] *= start_latent_strength
         y[:, -1:] *= end_latent_strength
         if control_embeds is None:
@@ -1506,7 +1556,8 @@ class WanVideoImageToVideoEncode:
             "lat_w": lat_w,
             "control_embeds": control_embeds["control_embeds"] if control_embeds is not None else None,
             "end_image": resized_end_image if end_image is not None else None,
-            "fun_model": fun_model
+            "fun_model": fun_model,
+            "has_ref": has_ref,
         }
 
         return (image_embeds,)
@@ -1623,6 +1674,7 @@ class WanVideoVACEEncode:
                 "input_frames": ("IMAGE",),
                 "ref_images": ("IMAGE",),
                 "input_masks": ("MASK",),
+                "prev_vace_embeds": ("WANVIDIMAGE_EMBEDS",),
             },
         }
 
@@ -1631,7 +1683,7 @@ class WanVideoVACEEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None):
+    def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None, prev_vace_embeds=None):
         
         self.device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1701,7 +1753,11 @@ class WanVideoVACEEncode:
             "target_shape": target_shape,
             "vace_start_percent": vace_start_percent,
             "vace_end_percent": vace_end_percent,
+            "additional_vace_inputs": [],
         }
+
+        if prev_vace_embeds is not None:
+            vace_input["additional_vace_inputs"].append(prev_vace_embeds)
     
         return (vace_input,)
     def vace_encode_frames(self, frames, ref_images, masks=None):
@@ -1826,7 +1882,7 @@ class WanVideoVACEStartToEndFrame:
     
         return (out_batch.cpu().float(), masks.cpu().float())
 
-#region Sampler
+
 
 class WanVideoContextOptions:
     @classmethod
@@ -1932,6 +1988,7 @@ class WanVideoExperimentalArgs:
     def process(self, **kwargs):
         return (kwargs,)
     
+#region Sampler
 class WanVideoSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -2031,8 +2088,8 @@ class WanVideoSampler:
         seed_g.manual_seed(seed)
        
         control_latents, clip_fea, clip_fea_neg, end_image = None, None, None, None
-        vace_context, vace_scale = None, None
-        fun_model, has_ref = False, False
+        vace_data, vace_context, vace_scale = None, None, None
+        fun_model, has_ref, drop_last = False, False, False
 
         image_cond = image_embeds.get("image_embeds", None)
        
@@ -2064,6 +2121,8 @@ class WanVideoSampler:
                 control_latents = control_embeds["control_images"].to(device)
                 control_start_percent = control_embeds.get("start_percent", 0.0)
                 control_end_percent = control_embeds.get("end_percent", 1.0)
+            drop_last = image_embeds.get("drop_last", False)
+            has_ref = image_embeds.get("has_ref", False)
         else: #t2v
             target_shape = image_embeds.get("target_shape", None)
             if target_shape is None:
@@ -2074,6 +2133,20 @@ class WanVideoSampler:
             vace_scale = image_embeds.get("vace_scale", None)
             vace_start_percent = image_embeds.get("vace_start_percent", 0.0)
             vace_end_percent = image_embeds.get("vace_end_percent", 1.0)
+
+            vace_additional_embeds = image_embeds.get("additional_vace_inputs", [])
+            if vace_context is not None:
+                vace_data = [
+                    {"context": vace_context, "scale": vace_scale, "start": vace_start_percent, "end": vace_end_percent}
+                ]
+                if len(vace_additional_embeds) > 0:
+                    for i in range(len(vace_additional_embeds)):
+                        vace_data.append({
+                            "context": vace_additional_embeds[i]["vace_context"],
+                            "scale": vace_additional_embeds[i]["vace_scale"],
+                            "start": vace_additional_embeds[i]["vace_start_percent"],
+                            "end": vace_additional_embeds[i]["vace_end_percent"],
+                        })
 
             noise = torch.randn(
                     target_shape[0],
@@ -2328,7 +2401,7 @@ class WanVideoSampler:
             zero_star_steps = experimental_args.get("zero_star_steps", 0)
 
         #region model pred
-        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, vace_context=None, teacache_state=None):
+        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, vace_data=None, teacache_state=None):
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=model["dtype"], enabled=True):
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
@@ -2365,13 +2438,6 @@ class WanVideoSampler:
                                 patcher.model.is_patched = True
                 else:
                     image_cond_input = image_cond
-
-                if vace_context is not None:
-                    vace_context_input = vace_context
-                    if not (vace_start_percent <= current_step_percentage <= vace_end_percent) or \
-                        (vace_end_percent < 1.0 and vace_end_percent > 0 and idx == 0 and 
-                         (current_step_percentage >= vace_start_percent and current_step_percentage > vace_end_percent)):
-                        vace_context_input = None
     
                 base_params = {
                     'seq_len': seq_len,
@@ -2381,8 +2447,7 @@ class WanVideoSampler:
                     'current_step': idx,
                     'y': [image_cond_input] if image_cond_input is not None else None,
                     'control_lora_enabled': control_lora_enabled,
-                    'vace_context': vace_context_input if vace_context is not None else None,
-                    'vace_scale': vace_scale,
+                    'vace_data': vace_data if vace_data is not None else None,
                 }
 
                 batch_size = 1
@@ -2679,10 +2744,10 @@ class WanVideoSampler:
                                 partial_img_emb[:, 0, :, :] =  partial_image_cond
                     
                     partial_vace_context = None
-                    if vace_context is not None:
-                        partial_vace_context = vace_context[0][:, c, :, :]
+                    if vace_data is not None:
+                        partial_vace_context = vace_data[0]["context"][0][:, c, :, :]
                         if has_ref:
-                            partial_vace_context[:, 0, :, :] = vace_context[0][:, 0, :, :]
+                            partial_vace_context[:, 0, :, :] = vace_data[0]["context"][0][:, 0, :, :]
                         partial_vace_context = [partial_vace_context]
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
@@ -2713,7 +2778,7 @@ class WanVideoSampler:
                     cfg[idx], 
                     text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
-                    timestep, idx, image_cond, clip_fea, control_latents, vace_context,
+                    timestep, idx, image_cond, clip_fea, control_latents, vace_data,
                     teacache_state=self.teacache_state)
 
             if latent_shift_loop:
@@ -2778,7 +2843,7 @@ class WanVideoSampler:
             pass
 
         return ({
-            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped, "end_image": end_image if not fun_model else None, "has_ref": has_ref 
+            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped, "end_image": end_image if not fun_model else None, "has_ref": has_ref, "drop_last": drop_last,
             }, )
     
 class WindowTracker:
@@ -2846,7 +2911,10 @@ class WanVideoDecode:
         latents = samples["samples"]
         end_image = samples.get("end_image", None)
         has_ref = samples.get("has_ref", False)
+        drop_last = samples.get("drop_last", False)
         is_looped = samples.get("looped", False)
+
+        print("drop_last", drop_last)
 
         vae.to(device)
 
@@ -2857,6 +2925,8 @@ class WanVideoDecode:
         
         if has_ref:
             latents = latents[:, :, 1:]
+        if drop_last:
+            latents = latents[:, :, :-1]
 
         #if is_looped:
         #   latents = torch.cat([latents[:, :, :warmup_latent_count],latents], dim=2)
@@ -2996,6 +3066,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoExperimentalArgs": WanVideoExperimentalArgs,
     "WanVideoVACEEncode": WanVideoVACEEncode,
     "WanVideoVACEStartToEndFrame": WanVideoVACEStartToEndFrame,
+    "WanVideoVACEModelSelect": WanVideoVACEModelSelect,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3030,4 +3101,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoExperimentalArgs": "WanVideo Experimental Args",
     "WanVideoVACEEncode": "WanVideo VACE Encode",
     "WanVideoVACEStartToEndFrame": "WanVideo VACE Start To End Frame",
+    "WanVideoVACEModelSelect": "WanVideo VACE Model Select",
     }
