@@ -49,6 +49,7 @@ def swa_flash_attention(query, key, value, grid_sizes, windows_size=4096):
     key = rearrange(key.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
     value = rearrange(value.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
     hidden_states = flash_attn_func(query, key, value, dropout_p=0.0, causal=False, window_size=(windows_size, windows_size))
+    hidden_states = rearrange(hidden_states,  "bs (h w f) hn hd -> bs (f h w) hn hd", f=num_frames, h=height, w=width)
     return hidden_states.to(out_dtype)
 
     querys = torch.tensor_split(query.to(torch.bfloat16), 7, 2)
