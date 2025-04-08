@@ -191,8 +191,123 @@ def standardize_lora_key_format(lora_sd):
         # Diffusers format
         if k.startswith('transformer.'):
             k = k.replace('transformer.', 'diffusion_model.')
+
+        # Fun LoRA format
+        if k.startswith('lora_unet__'):
+            # Split into main path and weight type parts
+            parts = k.split('.')
+            main_part = parts[0]  # e.g. lora_unet__blocks_0_cross_attn_k
+            weight_type = '.'.join(parts[1:]) if len(parts) > 1 else None  # e.g. lora_down.weight
             
-        # from finetrainer format
+            # Process the main part - convert from underscore to dot format
+            if 'blocks_' in main_part:
+                # Extract components
+                components = main_part[len('lora_unet__'):].split('_')
+                
+                # Start with diffusion_model
+                new_key = "diffusion_model"
+                
+                # Add blocks.N
+                if components[0] == 'blocks':
+                    new_key += f".blocks.{components[1]}"
+                    
+                    # Handle different module types
+                    idx = 2
+                    if idx < len(components):
+                        if components[idx] == 'self' and idx+1 < len(components) and components[idx+1] == 'attn':
+                            new_key += ".self_attn"
+                            idx += 2
+                        elif components[idx] == 'cross' and idx+1 < len(components) and components[idx+1] == 'attn':
+                            new_key += ".cross_attn"
+                            idx += 2
+                        elif components[idx] == 'ffn':
+                            new_key += ".ffn"
+                            idx += 1
+                    
+                    # Add the component (k, q, v, o) and handle img suffix
+                    if idx < len(components):
+                        component = components[idx]
+                        idx += 1
+                        
+                        # Check for img suffix
+                        if idx < len(components) and components[idx] == 'img':
+                            component += '_img'
+                            idx += 1
+                            
+                        new_key += f".{component}"
+                
+                # Handle weight type - this is the critical fix
+                if weight_type:
+                    if weight_type == 'alpha':
+                        new_key += '.alpha'
+                    elif weight_type == 'lora_down.weight' or weight_type == 'lora_down':
+                        new_key += '.lora_A.weight'
+                    elif weight_type == 'lora_up.weight' or weight_type == 'lora_up':
+                        new_key += '.lora_B.weight'
+                    else:
+                        # Keep original weight type if not matching our patterns
+                        new_key += f'.{weight_type}'
+                        # Add .weight suffix if missing
+                        if not new_key.endswith('.weight'):
+                            new_key += '.weight'
+                
+                k = new_key
+            else:
+                # For other lora_unet__ formats (head, embeddings, etc.)
+                new_key = main_part.replace('lora_unet__', 'diffusion_model.')
+                
+                # Fix specific component naming patterns
+                new_key = new_key.replace('_self_attn', '.self_attn')
+                new_key = new_key.replace('_cross_attn', '.cross_attn')
+                new_key = new_key.replace('_ffn', '.ffn')
+                new_key = new_key.replace('blocks_', 'blocks.')
+                new_key = new_key.replace('head_head', 'head.head')
+                new_key = new_key.replace('img_emb', 'img_emb')
+                new_key = new_key.replace('text_embedding', 'text.embedding')
+                new_key = new_key.replace('time_embedding', 'time.embedding')
+                new_key = new_key.replace('time_projection', 'time.projection')
+                
+                # Replace remaining underscores with dots, carefully
+                parts = new_key.split('.')
+                final_parts = []
+                for part in parts:
+                    if part in ['img_emb', 'self_attn', 'cross_attn']:
+                        final_parts.append(part)  # Keep these intact
+                    else:
+                        final_parts.append(part.replace('_', '.'))
+                new_key = '.'.join(final_parts)
+                
+                # Handle weight type
+                if weight_type:
+                    if weight_type == 'alpha':
+                        new_key += '.alpha'
+                    elif weight_type == 'lora_down.weight' or weight_type == 'lora_down':
+                        new_key += '.lora_A.weight'
+                    elif weight_type == 'lora_up.weight' or weight_type == 'lora_up':
+                        new_key += '.lora_B.weight'
+                    else:
+                        new_key += f'.{weight_type}'
+                        if not new_key.endswith('.weight'):
+                            new_key += '.weight'
+                
+                k = new_key
+                
+            # Handle special embedded components
+            special_components = {
+                'time.projection': 'time_projection',
+                'img.emb': 'img_emb',
+                'text.emb': 'text_emb',
+                'time.emb': 'time_emb',
+            }
+            for old, new in special_components.items():
+                if old in k:
+                    k = k.replace(old, new)
+
+        # Fix diffusion.model -> diffusion_model
+        if k.startswith('diffusion.model.'):
+            k = k.replace('diffusion.model.', 'diffusion_model.')
+            
+        # Finetrainer format
         if '.attn1.' in k:
             k = k.replace('.attn1.', '.cross_attn.')
             k = k.replace('.to_k.', '.k.')
@@ -882,7 +997,7 @@ class LoadWanVideoT5TextEncoder:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
-                "precision": (["fp16", "fp32", "bf16"],
+                "precision": (["fp32", "bf16"],
                     {"default": "bf16"}
                 ),
             },
@@ -1679,6 +1794,7 @@ class WanVideoVACEEncode:
                 "ref_images": ("IMAGE",),
                 "input_masks": ("MASK",),
                 "prev_vace_embeds": ("WANVIDIMAGE_EMBEDS",),
+                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
             },
         }
 
@@ -1687,7 +1803,7 @@ class WanVideoVACEEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None, prev_vace_embeds=None):
+    def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None, prev_vace_embeds=None, tiled_vae=False):
         
         self.device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1741,10 +1857,9 @@ class WanVideoVACEEncode:
             ref_images = ref_images.to(self.vae.dtype).to(self.device).unsqueeze(0).permute(0, 4, 1, 2, 3).unsqueeze(0)
             ref_images = ref_images * 2 - 1
       
-        z0 = self.vace_encode_frames(input_frames, ref_images, masks=input_masks)
+        z0 = self.vace_encode_frames(input_frames, ref_images, masks=input_masks, tiled_vae=tiled_vae)
         self.vae.model.clear_cache()
         m0 = self.vace_encode_masks(input_masks, ref_images)
-        self.vae.model.clear_cache()
         z = self.vace_latent(z0, m0)
 
         self.vae.to(offload_device)
@@ -1764,29 +1879,29 @@ class WanVideoVACEEncode:
             vace_input["additional_vace_inputs"].append(prev_vace_embeds)
     
         return (vace_input,)
-    def vace_encode_frames(self, frames, ref_images, masks=None):
+    def vace_encode_frames(self, frames, ref_images, masks=None, tiled_vae=False):
         if ref_images is None:
             ref_images = [None] * len(frames)
         else:
             assert len(frames) == len(ref_images)
 
         if masks is None:
-            latents = self.vae.encode(frames, self.device)
+            latents = self.vae.encode(frames, device=self.device, tiled=tiled_vae)
         else:
             inactive = [i * (1 - m) + 0 * m for i, m in zip(frames, masks)]
             reactive = [i * m + 0 * (1 - m) for i, m in zip(frames, masks)]
-            inactive = self.vae.encode(inactive, self.device)
-            reactive = self.vae.encode(reactive, self.device)
+            inactive = self.vae.encode(inactive, device=self.device, tiled=tiled_vae)
+            reactive = self.vae.encode(reactive, device=self.device, tiled=tiled_vae)
             latents = [torch.cat((u, c), dim=0) for u, c in zip(inactive, reactive)]
         self.vae.model.clear_cache()
         cat_latents = []
         for latent, refs in zip(latents, ref_images):
             if refs is not None:
                 if masks is None:
-                    ref_latent = self.vae.encode(refs, self.device)
+                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
                 else:
                     print("refs shape", refs.shape)#torch.Size([3, 1, 512, 512])
-                    ref_latent = self.vae.encode(refs, self.device)
+                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
                     ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
                 assert all([x.shape[1] == 1 for x in ref_latent])
                 latent = torch.cat([*ref_latent, latent], dim=1)
