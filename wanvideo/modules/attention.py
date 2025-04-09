@@ -248,13 +248,15 @@ def attention(
         return out
     elif attention_mode == 'sageattn':
         attn_mask = None
+        out_dtype = q.dtype
+        dtype = torch.bfloat16
 
-        q = q.transpose(1, 2)#.to(dtype)
-        k = k.transpose(1, 2)#.to(dtype)
-        v = v.transpose(1, 2)#.to(dtype)
+        q = q.transpose(1, 2).to(dtype)
+        k = k.transpose(1, 2).to(dtype)
+        v = v.transpose(1, 2).to(dtype)
 
         out = sageattn_func(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
-        out = out.transpose(1, 2).contiguous()
+        out = out.transpose(1, 2).contiguous().to(out_dtype)
         return out
