@@ -202,6 +202,16 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        if self.swa and (self.bidx + 1) % 5 != 0:
+            x = swa_flash_attention(
+                rope_apply(q, grid_sizes, freqs),
+                rope_apply(k, grid_sizes, freqs),
+                v,
+                grid_sizes
+            )
+            x = x.flatten(2)
+            x = self.o(x)
+            return x
 
         if rope_func == "comfy":
             q, k = apply_rope_comfy(q, k, freqs)
