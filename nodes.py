@@ -7,6 +7,23 @@ import numpy as np
 import math
 from tqdm import tqdm
 
+<<<<<<< HEAD
+=======
+from .wanvideo.modules.clip import CLIPModel
+from .wanvideo.modules.model import WanModel, rope_params
+from .wanvideo.modules.t5 import T5EncoderModel
+from .wanvideo.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
+                               get_sampling_sigmas, retrieve_timesteps)
+from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
+
+from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
+from .taehv import TAEHV
+
+from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
+
+>>>>>>> ori/main
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar, common_upscale
@@ -609,6 +626,17 @@ class WanVideoModelLoader:
         with init_empty_weights():
             transformer = WanModel(**TRANSFORMER_CONFIG)
         transformer.eval()
+
+        if "blocks.0.cam_encoder.weight" in sd:
+            log.info("ReCamMaster model detected, patching model...")
+            import torch.nn as nn
+            for block in transformer.blocks:
+                block.cam_encoder = nn.Linear(12, dim)
+                block.projector = nn.Linear(dim, dim)
+                block.cam_encoder.weight.data.zero_()
+                block.cam_encoder.bias.data.zero_()
+                block.projector.weight = nn.Parameter(torch.eye(dim))
+                block.projector.bias = nn.Parameter(torch.zeros(dim))
 
         comfy_model = WanVideoModel(
             WanVideoModelConfig(base_dtype),
@@ -2019,7 +2047,7 @@ class WanVideoVACEStartToEndFrame:
         return (out_batch.cpu().float(), masks.cpu().float())
 
 
-
+#region context options
 class WanVideoContextOptions:
     @classmethod
     def INPUT_TYPES(s):
@@ -2138,7 +2166,7 @@ class WanVideoSampler:
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
-                "scheduler": (["unipc", "dpm++", "dpm++_sde", "euler", "euler/beta"],
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis"],
                     {
                         "default": 'unipc'
                     }),
@@ -2160,6 +2188,7 @@ class WanVideoSampler:
                 "nocfg_begin": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "nocfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "experimental_args": ("EXPERIMENTALARGS", ),
+                "sigmas": ("SIGMAS", ),
             }
         }
 
@@ -2170,7 +2199,7 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, nocfg_begin=1.0, nocfg_end=1.0, experimental_args=None):
+        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, nocfg_begin=1.0, nocfg_end=1.0, experimental_args=None, sigmas=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -2189,29 +2218,38 @@ class WanVideoSampler:
         
         steps = int(steps/denoise_strength)
 
-        scheduler_args = {
-            "num_train_timesteps": 1000,
-            "shift": shift,
-            "use_dynamic_shifting": False,
-        }
-
         timesteps = None
-        if scheduler == 'unipc':
-            sample_scheduler = FlowUniPCMultistepScheduler(**scheduler_args)
-            sample_scheduler.set_timesteps(steps, device=device, shift=shift)
+        if 'unipc' in scheduler:
+            sample_scheduler = FlowUniPCMultistepScheduler(shift=shift)
+            if sigmas is None:
+                sample_scheduler.set_timesteps(steps, device=device, shift=shift, use_beta_sigmas=('beta' in scheduler))
+            else:
+                sample_scheduler.sigmas = sigmas.to(device)
+                sample_scheduler.timesteps = (sample_scheduler.sigmas[:-1] * 1000).to(torch.int64).to(device)
+                sample_scheduler.num_inference_steps = len(sample_scheduler.timesteps)
+
         elif scheduler in ['euler/beta', 'euler']:
-            sample_scheduler = FlowMatchEulerDiscreteScheduler(**scheduler_args, use_beta_sigmas=(scheduler == 'euler/beta'))
+            sample_scheduler = FlowMatchEulerDiscreteScheduler(shift=shift, use_beta_sigmas=(scheduler == 'euler/beta'))
             if flowedit_args: #seems to work better
                 timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=get_sampling_sigmas(steps, shift))
             else:
-                sample_scheduler.set_timesteps(steps, device=device, mu=1)  
+                sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None) 
         elif 'dpm++' in scheduler:
-            if scheduler == 'dpm++_sde':
+            if 'sde' in scheduler:
                 algorithm_type = "sde-dpmsolver++"
             else:
                 algorithm_type = "dpmsolver++"
-            sample_scheduler = FlowDPMSolverMultistepScheduler(**scheduler_args, algorithm_type= algorithm_type)
-            sample_scheduler.set_timesteps(steps, device=device, mu=1)
+            sample_scheduler = FlowDPMSolverMultistepScheduler(shift=shift, algorithm_type=algorithm_type)
+            if sigmas is None:
+                sample_scheduler.set_timesteps(steps, device=device, use_beta_sigmas=('beta' in scheduler))
+            else:
+                sample_scheduler.sigmas = sigmas.to(device)
+                sample_scheduler.timesteps = (sample_scheduler.sigmas[:-1] * 1000).to(torch.int64).to(device)
+                sample_scheduler.num_inference_steps = len(sample_scheduler.timesteps)
+        elif scheduler == 'deis':
+            sample_scheduler = DEISMultistepScheduler(use_flow_sigmas=True, prediction_type="flow_prediction", flow_shift=shift)
+            sample_scheduler.set_timesteps(steps, device=device)
+            sample_scheduler.sigmas[-1] = 1e-6
         
         if timesteps is None:
             timesteps = sample_scheduler.timesteps
@@ -2223,7 +2261,7 @@ class WanVideoSampler:
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
        
-        control_latents, clip_fea, clip_fea_neg, end_image = None, None, None, None
+        control_latents, clip_fea, clip_fea_neg, end_image, recammaster, camera_embed = None, None, None, None, None, None
         vace_data, vace_context, vace_scale = None, None, None
         fun_model, has_ref, drop_last = False, False, False
 
@@ -2283,6 +2321,8 @@ class WanVideoSampler:
                 ]
                 if len(vace_additional_embeds) > 0:
                     for i in range(len(vace_additional_embeds)):
+                        if vace_additional_embeds[i].get("has_ref", False):
+                            has_ref = True
                         vace_data.append({
                             "context": vace_additional_embeds[i]["vace_context"],
                             "scale": vace_additional_embeds[i]["vace_scale"],
@@ -2301,6 +2341,15 @@ class WanVideoSampler:
                     generator=seed_g)
             
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
+
+            recammaster = image_embeds.get("recammaster", None)
+            if recammaster is not None:
+                camera_embed = recammaster.get("camera_embed", None)
+                recam_latents = recammaster.get("source_latents", None)
+                orig_noise_len = noise.shape[1]
+                log.info(f"RecamMaster camera embed shape: {camera_embed.shape}")
+                log.info(f"RecamMaster source video shape: {recam_latents.shape}")
+                seq_len *= 2
             
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
@@ -2392,16 +2441,19 @@ class WanVideoSampler:
             from .context import get_context_scheduler
             context = get_context_scheduler(context_schedule)
 
-        if samples is not None and denoise_strength < 1.0:
-            latent_timestep = timesteps[:1].to(noise)
+        if samples is not None:
             input_samples = samples["samples"].squeeze(0).to(noise)
             if input_samples.shape[1] != noise.shape[1]:
                 input_samples = torch.cat([input_samples[:, :1].repeat(1, noise.shape[1] - input_samples.shape[1], 1, 1), input_samples], dim=1)
-            noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * input_samples
+            original_image = input_samples.to(device)
+            if denoise_strength < 1.0:
+                latent_timestep = timesteps[:1].to(noise)
+                noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * input_samples
 
-        if samples is not None:
-            original_image = samples["samples"].clone().squeeze(0).to(device)
             mask = samples.get("mask", None)
+            if mask is not None:
+                if mask.shape[2] != noise.shape[1]:
+                    mask = torch.cat([torch.zeros(1, noise.shape[0], noise.shape[1] - mask.shape[2], noise.shape[2], noise.shape[3]), mask], dim=2)            
 
         latent = noise.to(device)
 
@@ -2423,7 +2475,7 @@ class WanVideoSampler:
         if not isinstance(cfg, list):
             cfg = [cfg] * (steps +1)
 
-        print("Seq len:", seq_len)
+        log.info(f"Seq len: {seq_len}")
            
         pbar = ProgressBar(steps)
 
@@ -2584,6 +2636,9 @@ class WanVideoSampler:
                                 patcher.model.is_patched = True
                 else:
                     image_cond_input = image_cond
+
+                if recammaster is not None:
+                    z = torch.cat([z, recam_latents.to(z)], dim=1)
     
                 base_params = {
                     'seq_len': seq_len,
@@ -2594,6 +2649,7 @@ class WanVideoSampler:
                     'y': [image_cond_input] if image_cond_input is not None else None,
                     'control_lora_enabled': control_lora_enabled,
                     'vace_data': vace_data if vace_data is not None else None,
+                    'camera_embed': camera_embed,
                 }
 
                 batch_size = 1
@@ -2936,18 +2992,25 @@ class WanVideoSampler:
             
             if flowedit_args is None:
                 latent = latent.to(intermediate_device)
-                
+                step_args = {
+                    "generator": seed_g,
+                }
+                if isinstance(sample_scheduler, DEISMultistepScheduler):
+                    step_args.pop("generator", None)
                 temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
+                    noise_pred[:, :orig_noise_len].unsqueeze(0) if recammaster is not None else noise_pred.unsqueeze(0),
                     t,
-                    latent.unsqueeze(0),
+                    latent[:, :orig_noise_len].unsqueeze(0) if recammaster is not None else latent.unsqueeze(0),
                     return_dict=False,
-                    generator=seed_g)[0]
+                    **step_args)[0]
                 latent = temp_x0.squeeze(0)
 
                 x0 = latent.to(device)
                 if callback is not None:
-                    callback_latent = (latent_model_input - noise_pred.to(t.device) * t / 1000).detach().permute(1,0,2,3)
+                    if recammaster is not None:
+                        callback_latent = (latent_model_input[:, :orig_noise_len] - noise_pred[:, :orig_noise_len].to(t.device) * t / 1000).detach().permute(1,0,2,3)
+                    else:
+                        callback_latent = (latent_model_input - noise_pred.to(t.device) * t / 1000).detach().permute(1,0,2,3)
                     callback(idx, callback_latent, None, steps)
                 else:
                     pbar.update(1)
@@ -3060,15 +3123,12 @@ class WanVideoDecode:
         drop_last = samples.get("drop_last", False)
         is_looped = samples.get("looped", False)
 
-        print("drop_last", drop_last)
-
         vae.to(device)
 
         latents = latents.to(device = device, dtype = vae.dtype)
 
         mm.soft_empty_cache()
 
-        
         if has_ref:
             latents = latents[:, :, 1:]
         if drop_last:
