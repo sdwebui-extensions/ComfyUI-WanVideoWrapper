@@ -7,23 +7,9 @@ import numpy as np
 import math
 from tqdm import tqdm
 
-<<<<<<< HEAD
-=======
-from .wanvideo.modules.clip import CLIPModel
-from .wanvideo.modules.model import WanModel, rope_params
-from .wanvideo.modules.t5 import T5EncoderModel
-from .wanvideo.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
-                               get_sampling_sigmas, retrieve_timesteps)
-from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
-
-from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
-from .taehv import TAEHV
-
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
->>>>>>> ori/main
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar, common_upscale
@@ -2208,7 +2194,7 @@ class WanVideoSampler:
         from .wanvideo.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
         from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
         from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
-        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
         from .taehv import TAEHV
 
         control_lora = model["control_lora"]
