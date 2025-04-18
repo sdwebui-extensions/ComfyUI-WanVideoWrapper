@@ -2,13 +2,14 @@ import os
 import torch
 import torch.nn.functional as F
 import gc
-from .utils import log, print_memory, apply_lora, clip_encode_image_tiled
+from .utils import log, print_memory, apply_lora, clip_encode_image_tiled, fourier_filter
 import numpy as np
 import math
 from tqdm import tqdm
 
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
+from einops import rearrange
 
 import folder_paths
 import comfy.model_management as mm
@@ -194,6 +195,8 @@ def standardize_lora_key_format(lora_sd):
         # Diffusers format
         if k.startswith('transformer.'):
             k = k.replace('transformer.', 'diffusion_model.')
+        if k.startswith('pipe.dit.'): #unianimate-dit/diffsynth
+            k = k.replace('pipe.dit.', 'diffusion_model.')
 
         # Fun LoRA format
         if k.startswith('lora_unet__'):
@@ -578,17 +581,15 @@ class WanVideoModelLoader:
                 "e0": [-3.06553890e+05, 6.48419832e+04, -4.24062284e+03, 1.08991219e+02, -7.94696044e-01], #[8.10705460e+03, 2.13393892e+03, -3.72934672e+02, 1.66203073e+01, -4.17769401e-02],
             },
         }
-        
+        model_variant = "14B" #default to this
         if model_type == "i2v" or model_type == "fl2v":
-            if "480" in model or "fun" in model.lower() or "a2" in model.lower() or 'swa' in model.lower(): #just a guess for the Fun model for now...
+            if "480" in model or "fun" in model.lower() or "a2" in model.lower() or "540" in model or 'swa' in model.lower(): #just a guess for the Fun model for now...
                 model_variant = "i2v_480"
             elif "720" in model:
                 model_variant = "i2v_720"
         elif model_type == "t2v":
             model_variant = "14B"
-        else:
-            model_variant = "14B" #default to this
-            log.warning("Model variant not detected, defaulting TeaCache coefficients to 14B")
+            
         if dim == 1536:
             model_variant = "1_3B"
         log.info(f"Model variant detected: {model_variant}")
@@ -674,6 +675,11 @@ class WanVideoModelLoader:
                     lora_path = l["path"]
                     lora_strength = l["strength"]
                     lora_sd = load_torch_file(lora_path, safe_load=True)
+                    if "dwpose_embedding.0.weight" in lora_sd: #unianimate
+                        from .unianimate.nodes import update_transformer
+                        log.info("Unianimate LoRA detected, patching model...")
+                        transformer = update_transformer(transformer, lora_sd)
+
                     lora_sd = standardize_lora_key_format(lora_sd)
                     if l["blocks"]:
                         lora_sd = filter_state_dict_by_blocks(lora_sd, l["blocks"])
@@ -1579,7 +1585,8 @@ class WanVideoImageToVideoEncode:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, width, height, num_frames, clip_embeds, force_offload, noise_aug_strength, 
-                start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, temporal_mask=None, extra_latents=None):
+                start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, 
+                temporal_mask=None, extra_latents=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -2132,6 +2139,10 @@ class WanVideoExperimentalArgs:
                 "cfg_zero_star": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WeichenFan/CFG-Zero-star"}),
                 "use_zero_init": ("BOOLEAN", {"default": True}),
                 "zero_star_steps": ("INT", {"default": 0, "min": 0, "tooltip": "Steps to split self attention when using multiple prompts"}),
+                "use_fresca": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WikiChao/FreSca"}),
+                "fresca_scale_low": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "fresca_scale_high": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "fresca_freq_cutoff": ("INT", {"default": 20, "min": 0, "max": 10000, "step": 1}),
             },
         }
 
@@ -2182,6 +2193,7 @@ class WanVideoSampler:
                 "nocfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "experimental_args": ("EXPERIMENTALARGS", ),
                 "sigmas": ("SIGMAS", ),
+                "unianimate_poses": ("UNIANIMATE_POSE", ),
             }
         }
 
@@ -2192,7 +2204,7 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, nocfg_begin=1.0, nocfg_end=1.0, experimental_args=None, sigmas=None):
+        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, nocfg_begin=1.0, nocfg_end=1.0, experimental_args=None, sigmas=None, unianimate_poses=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -2368,6 +2380,30 @@ class WanVideoSampler:
                     )
                     masked_video_latents_input = torch.zeros_like(noise)
                     image_cond = torch.cat([mask_latents, masked_video_latents_input], dim=0).to(device)
+        
+        if unianimate_poses is not None:
+            transformer.dwpose_embedding.to(device)
+            transformer.randomref_embedding_pose.to(device)
+            dwpose_data = unianimate_poses["pose"]
+            dwpose_data = transformer.dwpose_embedding(
+                (torch.cat([dwpose_data[:,:,:1].repeat(1,1,3,1,1), dwpose_data], dim=2)
+                    ).to(device)).to(model["dtype"])
+            dwpose_data = rearrange(dwpose_data, 'b c f h w -> b (f h w) c').contiguous()
+            
+            random_ref_dwpose_data = None
+            if image_cond is not None:
+                random_ref_dwpose = unianimate_poses["ref"]
+                random_ref_dwpose_data = transformer.randomref_embedding_pose(
+                    random_ref_dwpose.to(device)#.permute(0,3,1,2)
+                    ).unsqueeze(2).to(model["dtype"]) # [1, 20, 104, 60]
+                
+            unianim_data = {
+                "dwpose": dwpose_data,
+                "random_ref": random_ref_dwpose_data.squeeze(0) if random_ref_dwpose_data is not None else None,
+                "strength": unianimate_poses["strength"],
+                "start_percent": unianimate_poses["start_percent"],
+                "end_percent": unianimate_poses["end_percent"]
+            }
             
         latent_video_length = noise.shape[1]
 
@@ -2580,7 +2616,7 @@ class WanVideoSampler:
                 drift_timesteps = torch.cat([drift_timesteps, torch.tensor([0]).to(drift_timesteps.device)]).to(drift_timesteps.device)
                 timesteps[-drift_steps:] = drift_timesteps[-drift_steps:]
 
-        use_cfg_zero_star = False
+        use_cfg_zero_star, use_fresca = False, False
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
             if video_attention_split_steps:
@@ -2590,6 +2626,12 @@ class WanVideoSampler:
             use_zero_init = experimental_args.get("use_zero_init", True)
             use_cfg_zero_star = experimental_args.get("cfg_zero_star", False)
             zero_star_steps = experimental_args.get("zero_star_steps", 0)
+
+            use_fresca = experimental_args.get("use_fresca", False)
+            if use_fresca:
+                fresca_scale_low = experimental_args.get("fresca_scale_low", 1.0)
+                fresca_scale_high = experimental_args.get("fresca_scale_high", 1.25)
+                fresca_freq_cutoff = experimental_args.get("fresca_freq_cutoff", 20)
 
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, vace_data=None, teacache_state=None):
@@ -2643,6 +2685,7 @@ class WanVideoSampler:
                     'control_lora_enabled': control_lora_enabled,
                     'vace_data': vace_data if vace_data is not None else None,
                     'camera_embed': camera_embed,
+                    'unianim_data': unianim_data if unianimate_poses is not None else None,
                 }
 
                 batch_size = 1
@@ -2684,9 +2727,21 @@ class WanVideoSampler:
                         noise_pred_cond.view(batch_size, -1),
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
-                    noise_pred = noise_pred_uncond * alpha + cfg_scale * (noise_pred_cond - noise_pred_uncond * alpha)
                 else:
-                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                    alpha = 1.0
+
+                #https://github.com/WikiChao/FreSca
+                if use_fresca:
+                    filtered_cond = fourier_filter(
+                        noise_pred_cond - noise_pred_uncond,
+                        scale_low=fresca_scale_low,
+                        scale_high=fresca_scale_high,
+                        freq_cutoff=fresca_freq_cutoff,
+                    )
+                    noise_pred = noise_pred_uncond * alpha + cfg_scale * filtered_cond * alpha
+                else:
+                    noise_pred = noise_pred_uncond * alpha + cfg_scale * (noise_pred_cond - noise_pred_uncond * alpha)
+                
 
                 return noise_pred, [teacache_state_cond, teacache_state_uncond]
 
