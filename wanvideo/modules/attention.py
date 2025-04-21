@@ -46,16 +46,20 @@ def swa_flash_attention(query, key, value, grid_sizes, windows_size=4096):
     out_dtype = query.dtype
     num_frames, height, width = grid_sizes[0][0], grid_sizes[0][1], grid_sizes[0][2]
 
-    querys = torch.tensor_split(query.to(torch.bfloat16), 2, 2)
-    keys = torch.tensor_split(key.to(torch.bfloat16), 2, 2)
-    values = torch.tensor_split(value.to(torch.bfloat16), 2, 2)
+    querys = torch.tensor_split(query.to(torch.bfloat16), 6, 2)
+    keys = torch.tensor_split(key.to(torch.bfloat16), 6, 2)
+    values = torch.tensor_split(value.to(torch.bfloat16), 6, 2)
     new_querys = []
     new_keys = []
     new_values = []
     for index, mode in enumerate(
         [
             "bs (f h w) hn hd -> bs (h w f) hn hd", 
-            "bs (f h w) hn hd -> bs (w h f) hn hd"
+            "bs (f h w) hn hd -> bs (w h f) hn hd",
+            "bs (f h w) hn hd -> bs (h f w) hn hd", 
+            "bs (f h w) hn hd -> bs (w f h) hn hd",
+            "bs (f h w) hn hd -> bs (f h w) hn hd", 
+            "bs (f h w) hn hd -> bs (f w h) hn hd",
         ]
     ):
         
@@ -66,24 +70,20 @@ def swa_flash_attention(query, key, value, grid_sizes, windows_size=4096):
     key = torch.cat(new_keys, dim=2)
     value = torch.cat(new_values, dim=2)
     hidden_states = flash_attn_func(query, key, value, dropout_p=0.0, causal=False, window_size=(windows_size, windows_size))
-    hidden_states = torch.tensor_split(hidden_states, 2, 2)
+    hidden_states = torch.tensor_split(hidden_states, 6, 2)
     new_hidden_states = []
     for index, mode in enumerate(
         [
             "bs (h w f) hn hd -> bs (f h w) hn hd", 
-            "bs (w h f) hn hd -> bs (f h w) hn hd"
+            "bs (w h f) hn hd -> bs (f h w) hn hd",
+            "bs (h f w) hn hd -> bs (f h w) hn hd", 
+            "bs (w f h) hn hd -> bs (f h w) hn hd",
+            "bs (f h w) hn hd -> bs (f h w) hn hd", 
+            "bs (f w h) hn hd -> bs (f h w) hn hd",
         ]
     ):
         new_hidden_states.append(rearrange(hidden_states[index], mode, f=num_frames, h=height, w=width))
     hidden_states = torch.cat(new_hidden_states, dim=2)
-    return hidden_states.to(out_dtype)
-
-
-    query = rearrange(query.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
-    key = rearrange(key.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
-    value = rearrange(value.to(torch.bfloat16),  "bs (f h w) hn hd -> bs (h w f) hn hd", f=num_frames, h=height, w=width)
-    hidden_states = flash_attn_func(query, key, value, dropout_p=0.0, causal=False, window_size=(windows_size, windows_size))
-    hidden_states = rearrange(hidden_states,  "bs (h w f) hn hd -> bs (f h w) hn hd", f=num_frames, h=height, w=width)
     return hidden_states.to(out_dtype)
 
 def flash_attention(

@@ -183,8 +183,12 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        if self.swa and (self.bidx + 1) % 5 != 0:
+            self.forward = self.swa_forward
+        else:
+            self.forward = self.ori_forward
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
+    def ori_forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -202,16 +206,6 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-        if self.swa and (self.bidx + 1) % 5 != 0:
-            x = swa_flash_attention(
-                rope_apply(q, grid_sizes, freqs),
-                rope_apply(k, grid_sizes, freqs),
-                v,
-                grid_sizes
-            )
-            x = x.flatten(2)
-            x = self.o(x)
-            return x
 
         if rope_func == "comfy":
             q, k = apply_rope_comfy(q, k, freqs)
@@ -237,6 +231,34 @@ class WanSelfAttention(nn.Module):
         if is_enhance_enabled():
             x *= feta_scores
 
+        return x
+    
+    def swa_forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # query, key, value function
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+        x = swa_flash_attention(
+            rope_apply(q, grid_sizes, freqs),
+            rope_apply(k, grid_sizes, freqs),
+            v,
+            grid_sizes
+        )
+        x = x.flatten(2)
+        x = self.o(x)
         return x
     
     def forward_split(self, x, seq_lens, grid_sizes, freqs, seq_chunks=1,current_step=0, video_attention_split_steps = [], rope_func = "default"):
