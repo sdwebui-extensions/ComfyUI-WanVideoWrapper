@@ -185,10 +185,8 @@ class WanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         if self.swa and (self.bidx + 1) % 5 != 0:
             self.forward = self.swa_forward
-        else:
-            self.forward = self.ori_forward
 
-    def ori_forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
+    def forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
