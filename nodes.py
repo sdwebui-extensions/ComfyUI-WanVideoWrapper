@@ -7,8 +7,6 @@ import numpy as np
 import math
 from tqdm import tqdm
 
-from accelerate import init_empty_weights
-from accelerate.utils import set_module_tensor_to_device
 from einops import rearrange
 
 import folder_paths
@@ -615,7 +613,7 @@ class WanVideoModelLoader:
             "vace_layers": vace_layers,
             "vace_in_dim": vace_in_dim,
             "swa": swa
-        }
+        }        
 
         with init_empty_weights():
             transformer = WanModel(**TRANSFORMER_CONFIG)
@@ -657,10 +655,9 @@ class WanVideoModelLoader:
                        total=param_count,
                        leave=True):
                     dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
-                    if "modulation" in name:
+                    if "modulation" in name or "time_" in name:
                         dtype_to_use = torch.float32
                     set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
-
             comfy_model.diffusion_model = transformer
             comfy_model.load_device = transformer_load_device
             
@@ -1500,6 +1497,7 @@ class WanVideoClipVisionEncode:
             image = image_1
 
         clip_vision.model.to(device)
+        
         negative_clip_embeds = None
 
         if tiles > 0:
@@ -1509,16 +1507,17 @@ class WanVideoClipVisionEncode:
                 negative_clip_embeds = clip_encode_image_tiled(clip_vision, negative_image.to(device), tiles=tiles, ratio=ratio)
         else:
             if isinstance(clip_vision, ClipVisionModel):
-                clip_embeds = clip_vision.encode_image(image).last_hidden_state.to(device)
+                clip_embeds = clip_vision.encode_image(image).penultimate_hidden_states.to(device)
                 if negative_image is not None:
-                    negative_clip_embeds = clip_vision.encode_image(negative_image).last_hidden_state.to(device)
+                    negative_clip_embeds = clip_vision.encode_image(negative_image).penultimate_hidden_states.to(device)
             else:
                 pixel_values = clip_preprocess(image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
                 clip_embeds = clip_vision.visual(pixel_values)
                 if negative_image is not None:
                     pixel_values = clip_preprocess(negative_image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
                     negative_clip_embeds = clip_vision.visual(pixel_values)
-        log.info(f"Clip embeds shape: {clip_embeds.shape}")
+    
+        log.info(f"Clip embeds shape: {clip_embeds.shape}, dtype: {clip_embeds.dtype}")
 
         weighted_embeds = []
         weighted_embeds.append(clip_embeds[0:1] * strength_1)
@@ -1540,6 +1539,8 @@ class WanVideoClipVisionEncode:
                 clip_embeds = torch.cat(weighted_embeds, dim=1)
             elif combine_embeds == "batch":
                 clip_embeds = torch.cat(weighted_embeds, dim=0)
+        else:
+            clip_embeds = weighted_embeds[0]
                 
 
         log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
@@ -2137,7 +2138,7 @@ class WanVideoExperimentalArgs:
         return {"required": {
                 "video_attention_split_steps": ("STRING", {"default": "", "tooltip": "Steps to split self attention when using multiple prompts"}),
                 "cfg_zero_star": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WeichenFan/CFG-Zero-star"}),
-                "use_zero_init": ("BOOLEAN", {"default": True}),
+                "use_zero_init": ("BOOLEAN", {"default": False}),
                 "zero_star_steps": ("INT", {"default": 0, "min": 0, "tooltip": "Steps to split self attention when using multiple prompts"}),
                 "use_fresca": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WikiChao/FreSca"}),
                 "fresca_scale_low": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
@@ -2170,7 +2171,7 @@ class WanVideoSampler:
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
-                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis"],
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis", "lcm", "lcm/beta"],
                     {
                         "default": 'unipc'
                     }),
@@ -2215,6 +2216,7 @@ class WanVideoSampler:
         from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
         from .taehv import TAEHV
+        from .wanvideo.utils.scheduling_flow_match_lcm import FlowMatchLCMScheduler
 
         control_lora = model["control_lora"]
 
@@ -2255,6 +2257,9 @@ class WanVideoSampler:
             sample_scheduler = DEISMultistepScheduler(use_flow_sigmas=True, prediction_type="flow_prediction", flow_shift=shift)
             sample_scheduler.set_timesteps(steps, device=device)
             sample_scheduler.sigmas[-1] = 1e-6
+        elif 'lcm' in scheduler:
+            sample_scheduler = FlowMatchLCMScheduler(shift=shift, use_beta_sigmas=(scheduler == 'lcm/beta'))
+            sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None) 
         
         if timesteps is None:
             timesteps = sample_scheduler.timesteps
@@ -2266,7 +2271,7 @@ class WanVideoSampler:
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
        
-        control_latents, clip_fea, clip_fea_neg, end_image, recammaster, camera_embed = None, None, None, None, None, None
+        control_latents, clip_fea, clip_fea_neg, end_image, recammaster, camera_embed, unianim_data = None, None, None, None, None, None, None
         vace_data, vace_context, vace_scale = None, None, None
         fun_or_fl2v_model, has_ref, drop_last = False, False, False
 
@@ -2380,6 +2385,8 @@ class WanVideoSampler:
                     )
                     masked_video_latents_input = torch.zeros_like(noise)
                     image_cond = torch.cat([mask_latents, masked_video_latents_input], dim=0).to(device)
+
+        latent_video_length = noise.shape[1]
         
         if unianimate_poses is not None:
             transformer.dwpose_embedding.to(device)
@@ -2388,24 +2395,34 @@ class WanVideoSampler:
             dwpose_data = transformer.dwpose_embedding(
                 (torch.cat([dwpose_data[:,:,:1].repeat(1,1,3,1,1), dwpose_data], dim=2)
                     ).to(device)).to(model["dtype"])
-            dwpose_data = rearrange(dwpose_data, 'b c f h w -> b (f h w) c').contiguous()
+            log.info(f"UniAnimate pose embed shape: {dwpose_data.shape}")
+            if dwpose_data.shape[2] > latent_video_length:
+                log.warning(f"UniAnimate pose embed length {dwpose_data.shape[2]} is longer than the video length {latent_video_length}, truncating")
+                dwpose_data = dwpose_data[:,:, :latent_video_length]
+            elif dwpose_data.shape[2] < latent_video_length:
+                log.warning(f"UniAnimate pose embed length {dwpose_data.shape[2]} is shorter than the video length {latent_video_length}, padding with last pose")
+                pad_len = latent_video_length - dwpose_data.shape[2]
+                pad = dwpose_data[:,:,:1].repeat(1,1,pad_len,1,1)
+                dwpose_data = torch.cat([dwpose_data, pad], dim=2)
+            dwpose_data_flat = rearrange(dwpose_data, 'b c f h w -> b (f h w) c').contiguous()
             
             random_ref_dwpose_data = None
             if image_cond is not None:
-                random_ref_dwpose = unianimate_poses["ref"]
-                random_ref_dwpose_data = transformer.randomref_embedding_pose(
-                    random_ref_dwpose.to(device)#.permute(0,3,1,2)
-                    ).unsqueeze(2).to(model["dtype"]) # [1, 20, 104, 60]
+                random_ref_dwpose = unianimate_poses.get("ref", None)
+                if random_ref_dwpose is not None:
+                    random_ref_dwpose_data = transformer.randomref_embedding_pose(
+                        random_ref_dwpose.to(device)
+                        ).unsqueeze(2).to(model["dtype"]) # [1, 20, 104, 60]
                 
             unianim_data = {
-                "dwpose": dwpose_data,
+                "dwpose": dwpose_data_flat,
                 "random_ref": random_ref_dwpose_data.squeeze(0) if random_ref_dwpose_data is not None else None,
                 "strength": unianimate_poses["strength"],
                 "start_percent": unianimate_poses["start_percent"],
                 "end_percent": unianimate_poses["end_percent"]
             }
             
-        latent_video_length = noise.shape[1]
+        
 
         is_looped = False
         if context_options is not None:
@@ -2634,7 +2651,8 @@ class WanVideoSampler:
                 fresca_freq_cutoff = experimental_args.get("fresca_freq_cutoff", 20)
 
         #region model pred
-        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, control_latents=None, vace_data=None, teacache_state=None):
+        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
+                             control_latents=None, vace_data=None, unianim_data=None, teacache_state=None):
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=model["dtype"], enabled=True):
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
@@ -2681,11 +2699,10 @@ class WanVideoSampler:
                     'freqs': freqs,
                     't': timestep,
                     'current_step': idx,
-                    'y': [image_cond_input] if image_cond_input is not None else None,
                     'control_lora_enabled': control_lora_enabled,
-                    'vace_data': vace_data if vace_data is not None else None,
+                    'vace_data': vace_data,
                     'camera_embed': camera_embed,
-                    'unianim_data': unianim_data if unianimate_poses is not None else None,
+                    'unianim_data': unianim_data,
                 }
 
                 batch_size = 1
@@ -2696,16 +2713,25 @@ class WanVideoSampler:
                 if not batched_cfg:
                     #cond
                     noise_pred_cond, teacache_state_cond = transformer(
-                        [z], context=positive_embeds, clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                        [z], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
+                        clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[0] if teacache_state else None,
                         **base_params
                     )
                     noise_pred_cond = noise_pred_cond[0].to(intermediate_device)
                     if math.isclose(cfg_scale, 1.0):
+                        if use_fresca:
+                            noise_pred_cond = fourier_filter(
+                                noise_pred_cond,
+                                scale_low=fresca_scale_low,
+                                scale_high=fresca_scale_high,
+                                freq_cutoff=fresca_freq_cutoff,
+                            )
                         return noise_pred_cond, [teacache_state_cond]
                     #uncond
                     noise_pred_uncond, teacache_state_uncond = transformer(
-                        [z], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea, 
+                        [z], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
+                        y=[image_cond_input] if image_cond_input is not None else None, 
                         is_uncond=True, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[1] if teacache_state else None,
                         **base_params
@@ -2715,7 +2741,9 @@ class WanVideoSampler:
                 else:
                     teacache_state_uncond = None
                     [noise_pred_cond, noise_pred_uncond], teacache_state_cond = transformer(
-                        [z] + [z], context=positive_embeds + negative_embeds, clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                        [z] + [z], context=positive_embeds + negative_embeds, 
+                        y=[image_cond_input] + [image_cond_input] if image_cond_input is not None else None,
+                        clip_fea=clip_fea.repeat(2,1,1), is_uncond=False, current_step_percentage=current_step_percentage,
                         pred_id=teacache_state[0] if teacache_state else None,
                         **base_params
                     )
@@ -3001,11 +3029,23 @@ class WanVideoSampler:
                         partial_vace_context = [partial_vace_context]
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
+                    partial_unianim_data = None
+                    if unianim_data is not None:
+                        partial_dwpose = dwpose_data[:, :, c, :, :]
+                        partial_dwpose_flat=rearrange(partial_dwpose, 'b c f h w -> b (f h w) c')
+                        partial_unianim_data = {
+                            "dwpose": partial_dwpose_flat,
+                            "random_ref": unianim_data["random_ref"],
+                            "strength": unianimate_poses["strength"],
+                            "start_percent": unianimate_poses["start_percent"],
+                            "end_percent": unianimate_poses["end_percent"]
+                        }
+
                     noise_pred_context, new_teacache = predict_with_cfg(
                         partial_latent_model_input, 
                         cfg[idx], positive, 
                         text_embeds["negative_prompt_embeds"], 
-                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context,
+                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,
                         current_teacache)
 
                     # if callback is not None:
@@ -3028,7 +3068,7 @@ class WanVideoSampler:
                     cfg[idx], 
                     text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
-                    timestep, idx, image_cond, clip_fea, control_latents, vace_data,
+                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data,
                     teacache_state=self.teacache_state)
 
             if latent_shift_loop:

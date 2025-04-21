@@ -184,7 +184,8 @@ class DWposeDetector:
             # return draw_pose(pose, H, W)
             return pose
 
-def draw_pose(pose, H, W):
+def draw_pose(pose, H, W, stick_width=4,draw_body=True, draw_hands=True, draw_feet=True, 
+              body_keypoint_size=4, hand_keypoint_size=4):
     bodies = pose['bodies']
     faces = pose['faces']
     hands = pose['hands']
@@ -192,15 +193,17 @@ def draw_pose(pose, H, W):
     subset = bodies['subset']
 
     canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
-    canvas = draw_body_and_foot(canvas, candidate, subset)
-    canvas = draw_handpose(canvas, hands)
+    canvas = draw_body_and_foot(canvas, candidate, subset, draw_body=draw_body, stick_width=stick_width, draw_feet=draw_feet, body_keypoint_size=body_keypoint_size)
+    canvas = draw_handpose(canvas, hands, draw_hands=draw_hands, hand_keypoint_size=hand_keypoint_size)
     canvas_without_face = copy.deepcopy(canvas)
     canvas = draw_facepose(canvas, faces)
 
     return canvas_without_face, canvas
 
 
-def pose_extract(pose_images, ref_image, dwpose_model, height, width, score_threshold):
+def pose_extract(pose_images, ref_image, dwpose_model, height, width, score_threshold, stick_width,
+                 draw_body=True, draw_hands=True, hand_keypoint_size=4, draw_feet=True,
+                 body_keypoint_size=4, handle_not_detected="repeat"):
     
     results_vis = []
     comfy_pbar = ProgressBar(len(pose_images))
@@ -210,12 +213,17 @@ def pose_extract(pose_images, ref_image, dwpose_model, height, width, score_thre
             pose_ref = dwpose_model(ref_image.squeeze(0), score_threshold=score_threshold)
         except:
             raise ValueError("No pose detected in reference image")
-    
+    prev_pose = None
     for img in tqdm(pose_images, desc="Pose Extraction", unit="image", total=len(pose_images)):
         try:
             pose = dwpose_model(img, score_threshold=score_threshold)
+            if handle_not_detected == "repeat":
+                prev_pose = pose
         except:
-            pose = torch.zeros_like(img)
+            if prev_pose is not None:
+                pose = prev_pose
+            else:
+                pose = np.zeros_like(img)
         results_vis.append(pose)
         comfy_pbar.update(1)
     
@@ -674,7 +682,9 @@ def pose_extract(pose_images, ref_image, dwpose_model, height, width, score_thre
     dwpose_woface_list = []
     for i in range(len(results_vis)):
         try:
-            dwpose_woface, dwpose_wface = draw_pose(results_vis[i], H=height, W=width)
+            dwpose_woface, dwpose_wface = draw_pose(results_vis[i], H=height, W=width, stick_width=stick_width,
+                                                    draw_body=draw_body, draw_hands=draw_hands, hand_keypoint_size=hand_keypoint_size,
+                                                    draw_feet=draw_feet, body_keypoint_size=body_keypoint_size)
             result = torch.from_numpy(dwpose_woface)
         except:
             result = torch.zeros((height, width, 3), dtype=torch.uint8)
@@ -683,7 +693,9 @@ def pose_extract(pose_images, ref_image, dwpose_model, height, width, score_thre
 
     dwpose_woface_ref_tensor = None
     if ref_image is not None:
-        dwpose_woface_ref, dwpose_wface_ref = draw_pose(pose_ref, H=height, W=width)
+        dwpose_woface_ref, dwpose_wface_ref = draw_pose(pose_ref, H=height, W=width, stick_width=stick_width,
+                                                        draw_body=draw_body, draw_hands=draw_hands, hand_keypoint_size=hand_keypoint_size,
+                                                        draw_feet=draw_feet, body_keypoint_size=body_keypoint_size)
         dwpose_woface_ref_tensor = torch.from_numpy(dwpose_woface_ref)
 
     return dwpose_woface_tensor, dwpose_woface_ref_tensor
@@ -692,8 +704,16 @@ class WanVideoUniAnimateDWPoseDetector:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-             "pose_images": ("IMAGE", {"tooltip": "Pose images"}),
-             "score_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Score threshold for pose detection"}),
+                "pose_images": ("IMAGE", {"tooltip": "Pose images"}),
+                "score_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Score threshold for pose detection"}),
+                "stick_width": ("INT", {"default": 4, "min": 1, "max": 100, "step": 1, "tooltip": "Stick width for drawing keypoints"}),
+                "draw_body": ("BOOLEAN", {"default": True, "tooltip": "Draw body keypoints"}),
+                "body_keypoint_size": ("INT", {"default": 4, "min": 0, "max": 100, "step": 1, "tooltip": "Body keypoint size"}),
+                "draw_feet": ("BOOLEAN", {"default": True, "tooltip": "Draw feet keypoints"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Draw hand keypoints"}),
+                "hand_keypoint_size": ("INT", {"default": 4, "min": 0, "max": 100, "step": 1, "tooltip": "Hand keypoint size"}),
+                "colorspace": (["RGB", "BGR"], {"tooltip": "Color space for the output image"}),
+                "handle_not_detected": (["empty", "repeat"], {"default": "empty", "tooltip": "How to handle undetected poses, empty inserts black and repeat inserts previous detection"}),
             },
             "optional": {
                 "reference_pose_image": ("IMAGE", {"tooltip": "Reference pose image"}),
@@ -705,7 +725,8 @@ class WanVideoUniAnimateDWPoseDetector:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, pose_images, score_threshold, reference_pose_image=None):
+    def process(self, pose_images, score_threshold, stick_width, reference_pose_image=None, draw_body=True, body_keypoint_size=4, 
+                draw_feet=True, draw_hands=True, hand_keypoint_size=4, colorspace="RGB", handle_not_detected="empty"):
 
         device = mm.get_torch_device()
         
@@ -749,12 +770,17 @@ class WanVideoUniAnimateDWPoseDetector:
             ref = reference_pose_image
             ref_np = ref.cpu().numpy() * 255
 
-        poses, reference_pose = pose_extract(pose_np, ref_np, self.dwpose_detector, height, width, score_threshold)
+        poses, reference_pose = pose_extract(pose_np, ref_np, self.dwpose_detector, height, width, score_threshold, stick_width=stick_width,
+                                             draw_body=draw_body, body_keypoint_size=body_keypoint_size, draw_feet=draw_feet, 
+                                             draw_hands=draw_hands, hand_keypoint_size=hand_keypoint_size, handle_not_detected=handle_not_detected)
         poses = poses / 255.0
         if reference_pose_image is not None:
             reference_pose = reference_pose.unsqueeze(0) / 255.0
         else:
             reference_pose = torch.zeros(1, 64, 64, 3, device=torch.device("cpu"))
+
+        if colorspace == "BGR":
+            poses=torch.flip(poses, dims=[-1])
 
         return (poses, reference_pose, )
 
@@ -763,10 +789,12 @@ class WanVideoUniAnimatePoseInput:
     def INPUT_TYPES(s):
         return {"required": {
             "pose_images": ("IMAGE", {"tooltip": "Pose images"}),
-            "reference_pose_image": ("IMAGE", {"tooltip": "Reference pose image"}),
             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength of the pose control"}),
             "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage for the pose control"}),
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percentage for the pose control"}),
+            },
+            "optional": {
+                "reference_pose_image": ("IMAGE", {"tooltip": "Reference pose image"}),
             },
         }
 
@@ -775,10 +803,13 @@ class WanVideoUniAnimatePoseInput:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, pose_images, reference_pose_image, strength, start_percent, end_percent):
+    def process(self, pose_images, strength, start_percent, end_percent, reference_pose_image=None):
 
         pose = pose_images.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
-        ref = reference_pose_image.permute(0, 3, 1, 2).contiguous()
+
+        ref = None
+        if reference_pose_image is not None:
+            ref = reference_pose_image.permute(0, 3, 1, 2).contiguous()
 
         unianim_poses = {
             "pose": pose,
