@@ -19,7 +19,10 @@ import comfy.model_management as mm
 from ...utils import log, get_module_memory_mb
 
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
-import flashinfer
+try:
+    import flashinfer
+except:
+    flashinfer = None
 
 def rope_riflex(pos, dim, theta, L_test, k, temporal):
     assert dim % 2 == 0
@@ -137,8 +140,9 @@ class WanRMSNorm(nn.Module):
         """
         bs, n, dim = x.shape
         x = x.view(-1, dim)
-        return flashinfer.norm.rmsnorm(x, self.weight, self.eps).type_as(x).view(bs, n, dim)
-        # return self._norm(x.float()).type_as(x) * self.weight
+        if flashinfer is not None:
+            return flashinfer.norm.rmsnorm(x, self.weight, self.eps).type_as(x).view(bs, n, dim)
+        return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps).to(x.dtype)
