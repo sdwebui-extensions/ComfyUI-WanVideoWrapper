@@ -122,7 +122,7 @@ def rope_apply(x, grid_sizes, freqs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).to(x.dtype)
 
 
 class WanRMSNorm(nn.Module):
@@ -1076,7 +1076,8 @@ class WanModel(ModelMixin, ConfigMixin):
         camera_embed=None,
         unianim_data=None,
         fps_embeds=None,
-        fun_ref = None
+        fun_ref = None,
+        fun_camera=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1127,6 +1128,10 @@ class WanModel(ModelMixin, ConfigMixin):
             self.original_patch_embedding(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype)
             for u in x
             ]
+
+        if self.control_adapter is not None and fun_camera is not None:
+            fun_camera = self.control_adapter(fun_camera)
+            x = [u + v for u, v in zip(x, fun_camera)]
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
