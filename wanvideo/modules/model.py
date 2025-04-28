@@ -1331,11 +1331,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 full_ref_length = fun_ref.size(1)
                 x = x[:, full_ref_length:]
                 grid_sizes = torch.stack([torch.tensor([u[0] - 1, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
-            
+            ori_dtype = x.dtype
             x = self.head.norm(x).to(torch.float32)
             e_unsqueezed = e.unsqueeze(1).to(torch.float32)
             e_head = (self.head.modulation.to(torch.float32).to(e.device) + e_unsqueezed).chunk(2, dim=1)
-            x = x * (1 + e_head[1].to(torch.float32)) + e_head[0].to(torch.float32)
+            x = (x * (1 + e_head[1].to(torch.float32)) + e_head[0].to(torch.float32)).to(ori_dtype)
 
             if self.enable_teacache and (self.teacache_start_step <= current_step <= self.teacache_end_step) and pred_id is not None:
                 self.teacache_state.update(
