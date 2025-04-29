@@ -468,6 +468,7 @@ class WanVideoModelLoader:
                 "lora": ("WANVIDLORA", {"default": None}),
                 "vram_management_args": ("VRAM_MANAGEMENTARGS", {"default": None, "tooltip": "Alternative offloading method from DiffSynth-Studio, more aggressive in reducing memory use than block swapping, but can be slower"}),
                 "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
+                "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
             }
         }
 
@@ -477,7 +478,7 @@ class WanVideoModelLoader:
     CATEGORY = "WanVideoWrapper"
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
-                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None):
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
         lora_low_mem_load = False
         if lora is not None:
@@ -624,6 +625,7 @@ class WanVideoModelLoader:
             transformer = WanModel(**TRANSFORMER_CONFIG)
         transformer.eval()
 
+        #ReCamMaster
         if "blocks.0.cam_encoder.weight" in sd:
             log.info("ReCamMaster model detected, patching model...")
             import torch.nn as nn
@@ -634,6 +636,16 @@ class WanVideoModelLoader:
                 block.cam_encoder.bias.data.zero_()
                 block.projector.weight = nn.Parameter(torch.eye(dim))
                 block.projector.bias = nn.Parameter(torch.zeros(dim))
+
+        # FantasyTalking https://github.com/Fantasy-AMAP
+        if fantasytalking_model is not None:
+            log.info("FantasyTalking model detected, patching model...")
+            context_dim = fantasytalking_model["sd"]["proj_model.proj.weight"].shape[0]
+            import torch.nn as nn
+            for block in transformer.blocks:
+                block.cross_attn.k_proj = nn.Linear(context_dim, dim, bias=False)
+                block.cross_attn.v_proj = nn.Linear(context_dim, dim, bias=False)
+            sd.update(fantasytalking_model["sd"])
         
         comfy_model = WanVideoModel(
             WanVideoModelConfig(base_dtype),
@@ -2269,6 +2281,7 @@ class WanVideoSampler:
                 "experimental_args": ("EXPERIMENTALARGS", ),
                 "sigmas": ("SIGMAS", ),
                 "unianimate_poses": ("UNIANIMATE_POSE", ),
+                "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
             }
         }
 
@@ -2279,7 +2292,9 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, nocfg_begin=1.0, nocfg_end=1.0, experimental_args=None, sigmas=None, unianimate_poses=None):
+        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, 
+        nocfg_begin=1.0, nocfg_end=1.0, 
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -2509,8 +2524,14 @@ class WanVideoSampler:
                 "start_percent": unianimate_poses["start_percent"],
                 "end_percent": unianimate_poses["end_percent"]
             }
-            
-        
+
+        audio_proj = None
+        if fantasytalking_embeds is not None:
+            audio_proj = fantasytalking_embeds["audio_proj"].to(device)
+            audio_context_lens = fantasytalking_embeds["audio_context_lens"]
+            audio_scale = fantasytalking_embeds["audio_scale"]
+            audio_cfg_scale = fantasytalking_embeds["audio_cfg_scale"]
+            log.info(f"Audio proj shape: {audio_proj.shape}, audio context lens: {audio_context_lens}")
 
         is_looped = False
         if context_options is not None:
@@ -2746,7 +2767,7 @@ class WanVideoSampler:
 
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
-                             control_latents=None, vace_data=None, unianim_data=None, teacache_state=None):
+                             control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, teacache_state=None):
             z = z.to(dtype)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"])):
 
@@ -2816,6 +2837,9 @@ class WanVideoSampler:
                     'camera_embed': camera_embed,
                     'unianim_data': unianim_data,
                     'fun_ref': fun_ref_input if fun_ref_image is not None else None,
+                    'audio_proj': audio_proj if fantasytalking_embeds is not None else None,
+                    'audio_context_lens': audio_context_lens if fantasytalking_embeds is not None else None,
+                    'audio_scale': audio_scale if fantasytalking_embeds is not None else None,
                 }
 
                 batch_size = 1
@@ -2843,6 +2867,9 @@ class WanVideoSampler:
                             )
                         return noise_pred_cond, [teacache_state_cond]
                     #uncond
+                    if fantasytalking_embeds is not None:
+                        if not math.isclose(audio_cfg_scale, 1.0):
+                            base_params['audio_proj'] = None
                     noise_pred_uncond, teacache_state_uncond = transformer(
                         [z_neg], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
                         y=[image_cond_input] if image_cond_input is not None else None, 
@@ -2866,6 +2893,27 @@ class WanVideoSampler:
                         
                         noise_pred = noise_pred_uncond + phantom_cfg_scale * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
                         return noise_pred, [teacache_state_cond, teacache_state_uncond, teacache_state_phantom]
+                    #fantasytalking
+                    if fantasytalking_embeds is not None:
+                        if not math.isclose(audio_cfg_scale, 1.0):
+                            if len(teacache_state) != 3:
+                                teacache_state.append(None)
+                            base_params['audio_proj'] = None
+                            noise_pred_no_audio, teacache_state_audio = transformer(
+                                [z_pos], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
+                                clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                                pred_id=teacache_state[2] if teacache_state else None,
+                                vace_data=vace_data,
+                                **base_params
+                            )
+                            noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
+                            noise_pred = (
+                                noise_pred_uncond
+                                + cfg_scale * (noise_pred_no_audio - noise_pred_uncond)
+                                + audio_cfg_scale * (noise_pred_cond - noise_pred_no_audio)
+                                )
+                            return noise_pred, [teacache_state_cond, teacache_state_uncond, teacache_state_audio]
+
                 #batched
                 else:
                     teacache_state_uncond = None
@@ -3156,6 +3204,10 @@ class WanVideoSampler:
                         if has_ref:
                             partial_vace_context[:, 0, :, :] = vace_data[0]["context"][0][:, 0, :, :]
                         partial_vace_context = [partial_vace_context]
+
+                    if fantasytalking_embeds is not None:
+                        partial_audio_proj = audio_proj[:, c]
+
                     partial_latent_model_input = latent_model_input[:, c, :, :]
 
                     partial_unianim_data = None
@@ -3174,7 +3226,7 @@ class WanVideoSampler:
                         partial_latent_model_input, 
                         cfg[idx], positive, 
                         text_embeds["negative_prompt_embeds"], 
-                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,
+                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
                         current_teacache)
 
                     # if callback is not None:
@@ -3197,7 +3249,7 @@ class WanVideoSampler:
                     cfg[idx], 
                     text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
-                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data,
+                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj,
                     teacache_state=self.teacache_state)
 
             if latent_shift_loop:
