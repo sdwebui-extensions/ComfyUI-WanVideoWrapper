@@ -44,14 +44,17 @@ class DownloadAndLoadWav2VecModel:
 
         model_path = os.path.join(folder_paths.models_dir, "transformers", model)
         if not os.path.exists(model_path):
-            log.info(f"Downloading Qwen model to: {model_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                repo_id=model,
-                ignore_patterns=["*.bin", "*.h5"],
-                local_dir=model_path,
-                local_dir_use_symlinks=False,
-            )
+            if os.path.exists("/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h"):
+                model_path = "/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h"
+            else:
+                log.info(f"Downloading Qwen model to: {model_path}")
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id=model,
+                    ignore_patterns=["*.bin", "*.h5"],
+                    local_dir=model_path,
+                    local_dir_use_symlinks=False,
+                )
 
         wav2vec_processor = Wav2Vec2Processor.from_pretrained(model_path)
         wav2vec = Wav2Vec2Model.from_pretrained(model_path).to(base_dtype).to(transfomer_load_device).eval()
