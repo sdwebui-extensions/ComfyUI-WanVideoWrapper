@@ -1121,7 +1121,7 @@ class WanModel(ModelMixin, ConfigMixin):
         camera_embed=None,
         unianim_data=None,
         fps_embeds=None,
-        fun_ref = None,
+        fun_ref=None,
         fun_camera=None,
         audio_proj=None,
         audio_context_lens=None,
@@ -1269,7 +1269,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
 
         clip_embed = None
-        if clip_fea is not None:
+        if clip_fea is not None and hasattr(self, "img_emb"):
             clip_fea = clip_fea.to(self.main_device)
             if self.offload_img_emb:
                 self.img_emb.to(self.main_device)
@@ -1298,10 +1298,11 @@ class WanModel(ModelMixin, ConfigMixin):
                     accumulated_rel_l1_distance += rescale_func((
                         (temb.to(device) - previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()
                         ).cpu().item())
+                    del temb
                 else:
                     temb_relative_l1 = relative_l1_distance(previous_modulated_input, e0)
                     accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
-                del temb
+                    del temb_relative_l1
 
                 #print("accumulated_rel_l1_distance", accumulated_rel_l1_distance)
 

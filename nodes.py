@@ -548,6 +548,9 @@ class WanVideoModelLoader:
             model_type = "i2v"
         elif in_channels == 16:
             model_type = "t2v"
+        elif "control_adapter.conv.weight" in sd:
+            model_type = "t2v"
+
         num_heads = 40 if dim == 5120 else 12
         num_layers = 40 if dim == 5120 else 30
 
@@ -617,7 +620,6 @@ class WanVideoModelLoader:
             "add_ref_conv": True if "ref_conv.weight" in sd else False,
             "in_dim_ref_conv": sd["ref_conv.weight"].shape[1] if "ref_conv.weight" in sd else None,
             "add_control_adapter": True if "control_adapter.conv.weight" in sd else False,
-            "in_dim_control_adapter": sd["control_adapter.conv.weight"].shape[1] if "control_adapter.conv.weight" in sd else None,
             "swa": swa,
         }        
 
@@ -661,7 +663,7 @@ class WanVideoModelLoader:
                 dtype = torch.float8_e5m2
             else:
                 dtype = base_dtype
-            params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding"}
+            params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter"}
             #if lora is not None:
             #    transformer_load_device = device
             if not lora_low_mem_load:
@@ -1584,13 +1586,13 @@ class WanVideoImageToVideoEncode:
             "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
             "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
-            "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
             "noise_aug_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of noise augmentation, helpful for I2V where some noise can add motion and give sharper results"}),
             "start_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
             "end_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
             "force_offload": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
                 "start_image": ("IMAGE", {"tooltip": "Image to encode"}),
                 "end_image": ("IMAGE", {"tooltip": "end frame"}),
                 "control_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Control signal for the Fun -model"}),
@@ -1605,9 +1607,9 @@ class WanVideoImageToVideoEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, vae, width, height, num_frames, clip_embeds, force_offload, noise_aug_strength, 
+    def process(self, vae, width, height, num_frames, force_offload, noise_aug_strength, 
                 start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, 
-                temporal_mask=None, extra_latents=None):
+                temporal_mask=None, extra_latents=None, clip_embeds=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1718,8 +1720,8 @@ class WanVideoImageToVideoEncode:
 
         image_embeds = {
             "image_embeds": y,
-            "clip_context": clip_embeds.get("clip_embeds", None),
-            "negative_clip_context": clip_embeds.get("negative_clip_embeds", None),
+            "clip_context": clip_embeds.get("clip_embeds", None) if clip_embeds is not None else None,
+            "negative_clip_context": clip_embeds.get("negative_clip_embeds", None) if clip_embeds is not None else None,
             "max_seq_len": max_seq_len,
             "num_frames": num_frames,
             "lat_h": lat_h,
@@ -2147,9 +2149,7 @@ class WanVideoContextOptions:
             "verbose": ("BOOLEAN", {"default": False, "tooltip": "Print debug output"}),
             },
             "optional": {
-                "image_cond_start_step": ("INT", {"default": 6, "min": 0, "max": 10000, "step": 1, "tooltip": "!EXPERIMENTAL! Start step of using previous window results as input instead of the init image"}),
-                "image_cond_window_count": ("INT", {"default": 2, "min": 1, "max": 10000, "step": 1, "tooltip": "!EXPERIMENTAL! Number of image 'prompt windows'"}),
-                "vae": ("WANVAE",),
+               "vae": ("WANVAE",),
             }
         }
 
@@ -2167,12 +2167,60 @@ class WanVideoContextOptions:
             "context_overlap":context_overlap,
             "freenoise":freenoise,
             "verbose":verbose,
-            "image_cond_start_step": image_cond_start_step,
-            "image_cond_window_count": image_cond_window_count,
             "vae": vae,
         }
 
         return (context_options,)
+    
+class CreateCFGScheduleFloatList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "steps": ("INT", {"default": 30, "min": 2, "max": 1000, "step": 1, "tooltip": "Number of steps to schedule cfg for"} ),
+            "cfg_scale_start": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 30.0, "step": 0.01, "round": 0.01, "tooltip": "CFG scale to use for the steps"}),
+            "cfg_scale_end": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 30.0, "step": 0.01, "round": 0.01, "tooltip": "CFG scale to use for the steps"}),
+            "interpolation": (["linear", "ease_in", "ease_out"], {"default": "linear", "tooltip": "Interpolation method to use for the cfg scale"}),
+            "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01,"tooltip": "Start percent of the steps to apply cfg"}),
+            "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01,"tooltip": "End percent of the steps to apply cfg"}),
+            }
+        }
+
+    RETURN_TYPES = ("FLOAT", )
+    RETURN_NAMES = ("float_list",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Helper node to generate a list of floats that can be used to schedule cfg scale for the steps, outside the set range cfg is set to 1.0"
+
+    def process(self, steps, cfg_scale_start, cfg_scale_end, interpolation, start_percent, end_percent):
+        
+        # Create a list of floats for the cfg schedule
+        cfg_list = [1.0] * steps
+        start_idx = min(int(steps * start_percent), steps - 1)
+        end_idx = min(int(steps * end_percent), steps - 1)
+        
+        for i in range(start_idx, end_idx + 1):
+            if i >= steps:
+                break
+                
+            if end_idx == start_idx:
+                t = 0
+            else:
+                t = (i - start_idx) / (end_idx - start_idx)
+            
+            if interpolation == "linear":
+                factor = t
+            elif interpolation == "ease_in":
+                factor = t * t
+            elif interpolation == "ease_out":
+                factor = t * (2 - t)
+            
+            cfg_list[i] = round(cfg_scale_start + factor * (cfg_scale_end - cfg_scale_start), 2)
+        
+        # If start_percent > 0, always include the first step
+        if start_percent > 0:
+            cfg_list[0] = 1.0
+
+        return (cfg_list,)
     
 class WanVideoFlowEdit:
     @classmethod
@@ -2224,7 +2272,7 @@ class WanVideoExperimentalArgs:
         return {"required": {
                 "video_attention_split_steps": ("STRING", {"default": "", "tooltip": "Steps to split self attention when using multiple prompts"}),
                 "cfg_zero_star": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WeichenFan/CFG-Zero-star"}),
-                "use_zero_init": ("BOOLEAN", {"default": True}),
+                "use_zero_init": ("BOOLEAN", {"default": False}),
                 "zero_star_steps": ("INT", {"default": 0, "min": 0, "tooltip": "Steps to split self attention when using multiple prompts"}),
                 "use_fresca": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WikiChao/FreSca"}),
                 "fresca_scale_low": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
@@ -2361,9 +2409,9 @@ class WanVideoSampler:
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
        
-        control_latents, clip_fea, clip_fea_neg, end_image, recammaster, camera_embed, unianim_data = None, None, None, None, None, None, None
-        vace_data, vace_context, vace_scale = None, None, None
-        fun_or_fl2v_model, has_ref, drop_last, = False, False, False
+        control_latents = control_camera_latents = clip_fea = clip_fea_neg = end_image = recammaster = camera_embed = unianim_data = None
+        vace_data = vace_context = vace_scale = None
+        fun_or_fl2v_model = has_ref = drop_last = False
         phantom_latents = None
         fun_ref_image = None
 
@@ -2396,9 +2444,12 @@ class WanVideoSampler:
 
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
-                if transformer.in_dim != 48:
+                if transformer.in_dim not in [48, 32]:
                     raise ValueError("Control signal only works with Fun-Control model")
-                control_latents = control_embeds["control_images"].to(device)
+                control_latents = control_embeds.get("control_images", None)
+                control_camera_latents = control_embeds.get("control_camera_latents", None)
+                control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
+                control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
                 control_start_percent = control_embeds.get("start_percent", 0.0)
                 control_end_percent = control_embeds.get("end_percent", 1.0)
             drop_last = image_embeds.get("drop_last", False)
@@ -2459,7 +2510,15 @@ class WanVideoSampler:
             
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
-                control_latents = control_embeds["control_images"].to(device)
+                control_latents = control_embeds.get("control_images", None)
+                if control_latents is not None:
+                    control_latents = control_latents.to(device)
+                control_camera_latents = control_embeds.get("control_camera_latents", None)
+                control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
+                control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
+                if control_camera_latents is not None:
+                    control_camera_latents = control_camera_latents.to(device)
+
                 if control_lora:
                     image_cond = control_latents.to(device)
                     if not patcher.model.is_patched:
@@ -2467,9 +2526,9 @@ class WanVideoSampler:
                         patcher = apply_lora(patcher, device, device, low_mem_load=False)
                         patcher.model.is_patched = True
                 else:
-                    if transformer.in_dim != 48:
+                    if transformer.in_dim not in [48, 32]:
                         raise ValueError("Control signal only works with Fun-Control model")
-                    image_cond = torch.zeros_like(control_latents).to(device) #fun control
+                    image_cond = torch.zeros_like(noise).to(device) #fun control
                     clip_fea = None
                     fun_ref_image = control_embeds.get("fun_ref_image", None)
                 control_start_percent = control_embeds.get("start_percent", 0.0)
@@ -2531,6 +2590,8 @@ class WanVideoSampler:
             audio_context_lens = fantasytalking_embeds["audio_context_lens"]
             audio_scale = fantasytalking_embeds["audio_scale"]
             audio_cfg_scale = fantasytalking_embeds["audio_cfg_scale"]
+            if not isinstance(audio_cfg_scale, list):
+                audio_cfg_scale = [audio_cfg_scale] * (steps +1)
             log.info(f"Audio proj shape: {audio_proj.shape}, audio context lens: {audio_context_lens}")
 
         is_looped = False
@@ -2650,6 +2711,8 @@ class WanVideoSampler:
             for name, param in transformer.named_parameters():
                 if "block" not in name:
                     param.data = param.data.to(device)
+                if "control_adapter" in name:
+                    param.data = param.data.to(device)
                 elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
                     param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
                 elif block_swap_args["offload_img_emb"] and "img_emb" in name:
@@ -2767,7 +2830,7 @@ class WanVideoSampler:
 
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
-                             control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, teacache_state=None):
+                             control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None, teacache_state=None):
             z = z.to(dtype)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"])):
 
@@ -2807,9 +2870,16 @@ class WanVideoSampler:
                             if not patcher.model.is_patched:
                                 log.info("Loading LoRA...")
                                 patcher = apply_lora(patcher, device, device, low_mem_load=False)
-                                patcher.model.is_patched = True
+                                patcher.model.is_patched = True                   
                 else:
                     image_cond_input = image_cond.to(z) if image_cond is not None else None
+
+                if control_camera_latents is not None:
+                    if (control_camera_start_percent <= current_step_percentage <= control_camera_end_percent) or \
+                            (control_end_percent > 0 and idx == 0 and current_step_percentage >= control_camera_start_percent):
+                        control_camera_input = control_camera_latents.to(z)
+                    else:
+                        control_camera_input = None
 
                 if recammaster is not None:
                     z = torch.cat([z, recam_latents.to(z)], dim=1)
@@ -2822,7 +2892,7 @@ class WanVideoSampler:
                         z_phantom_img = torch.cat([z[:,:-phantom_latents.shape[1]], phantom_latents.to(z)], dim=1)
                         z_neg = torch.cat([z[:,:-phantom_latents.shape[1]], torch.zeros_like(phantom_latents).to(z)], dim=1)
                         use_phantom = True
-                        if len(teacache_state) != 3:
+                        if teacache_state is not None and len(teacache_state) != 3:
                             teacache_state.append(None)
                 if not use_phantom:
                     z_pos = z_neg = z
@@ -2837,6 +2907,7 @@ class WanVideoSampler:
                     'camera_embed': camera_embed,
                     'unianim_data': unianim_data,
                     'fun_ref': fun_ref_input if fun_ref_image is not None else None,
+                    'fun_camera': control_camera_input if control_camera_latents is not None else None,
                     'audio_proj': audio_proj if fantasytalking_embeds is not None else None,
                     'audio_context_lens': audio_context_lens if fantasytalking_embeds is not None else None,
                     'audio_scale': audio_scale if fantasytalking_embeds is not None else None,
@@ -2868,7 +2939,7 @@ class WanVideoSampler:
                         return noise_pred_cond, [teacache_state_cond]
                     #uncond
                     if fantasytalking_embeds is not None:
-                        if not math.isclose(audio_cfg_scale, 1.0):
+                        if not math.isclose(audio_cfg_scale[idx], 1.0):
                             base_params['audio_proj'] = None
                     noise_pred_uncond, teacache_state_uncond = transformer(
                         [z_neg], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
@@ -2895,8 +2966,8 @@ class WanVideoSampler:
                         return noise_pred, [teacache_state_cond, teacache_state_uncond, teacache_state_phantom]
                     #fantasytalking
                     if fantasytalking_embeds is not None:
-                        if not math.isclose(audio_cfg_scale, 1.0):
-                            if len(teacache_state) != 3:
+                        if not math.isclose(audio_cfg_scale[idx], 1.0):
+                            if teacache_state is not None and len(teacache_state) != 3:
                                 teacache_state.append(None)
                             base_params['audio_proj'] = None
                             noise_pred_no_audio, teacache_state_audio = transformer(
@@ -2910,7 +2981,7 @@ class WanVideoSampler:
                             noise_pred = (
                                 noise_pred_uncond
                                 + cfg_scale * (noise_pred_no_audio - noise_pred_uncond)
-                                + audio_cfg_scale * (noise_pred_cond - noise_pred_no_audio)
+                                + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_no_audio)
                                 )
                             return noise_pred, [teacache_state_cond, teacache_state_uncond, teacache_state_audio]
 
@@ -3164,55 +3235,32 @@ class WanVideoSampler:
                     partial_img_emb = None
                     partial_control_latents = None
                     if image_cond is not None:
-                        log.info(f"Image cond shape: {image_cond.shape}")
-                        num_windows= context_options["image_cond_window_count"]
-                        section_size = latent_video_length / num_windows
-                        image_index = min(int(max(c) / section_size), num_windows - 1)
-                        partial_img_emb = image_cond[:, c, :, :]
+                        partial_img_emb = image_cond[:, c]
+                        partial_img_emb[:, 0] = image_cond[:, 0].to(intermediate_device)
+
                         if control_latents is not None:
-                            partial_control_latents = control_latents[:, c, :, :]
-                        partial_image_cond = image_cond[:, 0, :, :].to(intermediate_device)
-                        log.info(f"image_index: {image_index}")
-                        if hasattr(self, "previous_noise_pred_context") and image_index > 0: #wip
-                            if idx >= context_options["image_cond_start_step"]:
-                                #strength = 0.5
-                                #partial_image_cond *= strength
-                                mask = torch.ones(4, partial_img_emb.shape[2], partial_img_emb.shape[3], device=partial_img_emb.device, dtype=partial_img_emb.dtype) #torch.Size([20, 10, 104, 60])
-                                if context_vae is not None:
-                                    to_decode = self.previous_noise_pred_context[:,-1,:, :].unsqueeze(1).unsqueeze(0).to(context_vae.dtype)
-                                    #to_decode = to_decode.permute(0, 1, 3, 2)
-                                    #print("to_decode.shape", to_decode.shape)
-                                    if isinstance(context_vae, TAEHV):
-                                        image = context_vae.decode_video(to_decode.permute(0, 2, 1, 3, 4), parallel=False)
-                                        image = context_vae.encode_video(image.repeat(1, 5, 1, 1, 1), parallel=False).permute(0, 2, 1, 3, 4)
-                                    else:
-                                        image = context_vae.decode(to_decode, device=device, tiled=False)[0]
-                                        image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
-                                    #print("decoded image.shape", image.shape) #torch.Size([3, 37, 832, 480])
-                                    #print("encoded image.shape", image.shape)
-                                    #partial_img_emb[:, 0, :, :] = image[0][:,0,:,:]                                        
-                                    #print("partial_img_emb.shape", partial_img_emb.shape)
-                                    #print("mask.shape", mask.shape)
-                                    #print("self.previous_noise_pred_context.shape", self.previous_noise_pred_context.shape) #torch.Size([16, 10, 104, 60])
-                                    partial_img_emb[:, 0, :, :] =  torch.cat([image[0][:,0,:,:], mask], dim=0)
-                            else:
-                                partial_img_emb[:, 0, :, :] =  partial_image_cond
+                            partial_control_latents = control_latents[:, c]
+                    
+                    partial_control_camera_latents = None
+                    if control_camera_latents is not None:
+                        partial_control_camera_latents = control_camera_latents[:, :, c]
                     
                     partial_vace_context = None
                     if vace_data is not None:
-                        partial_vace_context = vace_data[0]["context"][0][:, c, :, :]
+                        partial_vace_context = vace_data[0]["context"][0][:, c]
                         if has_ref:
-                            partial_vace_context[:, 0, :, :] = vace_data[0]["context"][0][:, 0, :, :]
+                            partial_vace_context[:, 0] = vace_data[0]["context"][0][:, 0]
                         partial_vace_context = [partial_vace_context]
 
+                    partial_audio_proj = None
                     if fantasytalking_embeds is not None:
                         partial_audio_proj = audio_proj[:, c]
 
-                    partial_latent_model_input = latent_model_input[:, c, :, :]
+                    partial_latent_model_input = latent_model_input[:, c]
 
                     partial_unianim_data = None
                     if unianim_data is not None:
-                        partial_dwpose = dwpose_data[:, :, c, :, :]
+                        partial_dwpose = dwpose_data[:, :, c]
                         partial_dwpose_flat=rearrange(partial_dwpose, 'b c f h w -> b (f h w) c')
                         partial_unianim_data = {
                             "dwpose": partial_dwpose_flat,
@@ -3226,21 +3274,15 @@ class WanVideoSampler:
                         partial_latent_model_input, 
                         cfg[idx], positive, 
                         text_embeds["negative_prompt_embeds"], 
-                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
+                        timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,partial_control_camera_latents,
                         current_teacache)
-
-                    # if callback is not None:
-                    #     callback_latent = (noise_pred.to(t.device) * t / 1000).detach().permute(1,0,2,3)
-                    #     callback(idx, callback_latent, None, steps)
 
                     if teacache_args is not None:
                         self.window_tracker.teacache_states[window_id] = new_teacache
-                    if image_cond is not None and image_index > 0:
-                        self.previous_noise_pred_context = noise_pred_context
 
                     window_mask = create_window_mask(noise_pred_context, c, latent_video_length, context_overlap, looped=is_looped)                    
-                    noise_pred[:, c, :, :] += noise_pred_context * window_mask
-                    counter[:, c, :, :] += window_mask
+                    noise_pred[:, c] += noise_pred_context * window_mask
+                    counter[:, c] += window_mask
                 noise_pred /= counter
             #normal inference
             else:
@@ -3249,7 +3291,7 @@ class WanVideoSampler:
                     cfg[idx], 
                     text_embeds["prompt_embeds"], 
                     text_embeds["negative_prompt_embeds"], 
-                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj,
+                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents,
                     teacache_state=self.teacache_state)
 
             if latent_shift_loop:
@@ -3555,6 +3597,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoVACEStartToEndFrame": WanVideoVACEStartToEndFrame,
     "WanVideoVACEModelSelect": WanVideoVACEModelSelect,
     "WanVideoPhantomEmbeds": WanVideoPhantomEmbeds,
+    "CreateCFGScheduleFloatList": CreateCFGScheduleFloatList
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3591,4 +3634,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoVACEStartToEndFrame": "WanVideo VACE Start To End Frame",
     "WanVideoVACEModelSelect": "WanVideo VACE Model Select",
     "WanVideoPhantomEmbeds": "WanVideo Phantom Embeds",
+    "CreateCFGScheduleFloatList": "WanVideo CFG Schedule Float List"
     }
