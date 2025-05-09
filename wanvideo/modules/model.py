@@ -81,7 +81,7 @@ def sinusoidal_embedding_1d(dim, position):
 
 def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
     assert dim % 2 == 0
-    exponents = torch.arange(0, dim, 2, dtype=torch.float64).div(dim)
+    exponents = torch.arange(0, dim, 2, dtype=torch.float32).div(dim)
     inv_theta_pow = 1.0 / torch.pow(theta, exponents)
     
     if k > 0:
@@ -99,7 +99,7 @@ def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
     output = []
@@ -107,14 +107,15 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
             seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        # freqs_i = torch.cat([
+        #     freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        #     freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        #     freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        # ],
+        #                     dim=-1).reshape(seq_len, 1, -1)
+        freqs_i = freqs[i]
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
@@ -1214,6 +1215,16 @@ class WanModel(ModelMixin, ConfigMixin):
 
             freqs = self.rope_embedder(img_ids).movedim(1, 2)
         else:
+            hd = self.dim // self.num_heads // 2
+            freqs = freqs.split([hd - 2 * (hd // 3), hd // 3, hd // 3], dim=1)
+            freqs = [
+                torch.cat(
+                    [
+                        freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                        freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                        freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                    ],
+                    dim=-1).reshape(seq_len, 1, -1) for i, (f, h, w) in enumerate(grid_sizes.tolist())]
             rope_func = "default"
 
         # time embeddings
