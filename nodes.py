@@ -746,7 +746,7 @@ class WanVideoModelLoader:
                 if quantization == "fp8_e4m3fn_fast_no_ffn":
                     params_to_keep.update({"ffn"})
                 print(params_to_keep)
-                convert_fp8_linear(patcher.model.diffusion_model, base_dtype, params_to_keep=params_to_keep)
+                convert_fp8_linear(patcher.model.diffusion_model, base_dtype, params_to_keep=params_to_keep, sd=sd, device=device)
 
             del sd
 

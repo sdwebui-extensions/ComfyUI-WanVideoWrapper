@@ -757,7 +757,7 @@ class WanVideoUniAnimateDWPoseDetector:
             
         if not os.path.exists(model_pose):
             if os.path.exists('/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5'):
-                model_det = os.path.join("/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5", dw_pose_model)
+                model_pose = os.path.join("/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5", dw_pose_model)
             else:
                 log.info(f"Downloading dwpose model to: {model_base_path}")
                 from huggingface_hub import snapshot_download

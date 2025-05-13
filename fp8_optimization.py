@@ -11,7 +11,7 @@ def fp8_linear_forward(cls, original_dtype, input):
             inn = input.reshape(-1, input.shape[2]).to(weight_dtype)
             w = cls.weight.t()
 
-            scale = torch.ones((1), device=input.device, dtype=torch.float32)
+            scale = cls.scale_weight
             bias = cls.bias.to(original_dtype) if cls.bias is not None else None
 
             if bias is not None:
@@ -28,12 +28,13 @@ def fp8_linear_forward(cls, original_dtype, input):
     else:
         return cls.original_forward(input)
 
-def convert_fp8_linear(module, original_dtype, params_to_keep={}):
+def convert_fp8_linear(module, original_dtype, params_to_keep={}, sd={}, device='cpu'):
     setattr(module, "fp8_matmul_enabled", True)
    
     for name, module in module.named_modules():
         if not any(keyword in name for keyword in params_to_keep):
             if isinstance(module, nn.Linear):
+                setattr(module, "scale_weight", torch.ones((1), device=device, dtype=torch.float32))
                 original_forward = module.forward
                 setattr(module, "original_forward", original_forward)
                 setattr(module, "forward", lambda input, m=module: fp8_linear_forward(m, original_dtype, input))
