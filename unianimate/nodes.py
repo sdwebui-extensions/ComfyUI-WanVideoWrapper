@@ -4,6 +4,7 @@ from ..utils import log
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from tqdm import tqdm
+import folder_paths
 
 def update_transformer(transformer, state_dict):
     
@@ -733,8 +734,12 @@ class WanVideoUniAnimateDWPoseDetector:
         dw_pose_model = "dw-ll_ucoco_384_bs5.torchscript.pt"
         yolo_model = "yolox_l.torchscript.pt"
 
-        script_directory = os.path.dirname(os.path.abspath(__file__))
-        model_base_path = os.path.join(script_directory, "models", "DWPose")
+        model_base_path = os.path.join(folder_paths.models_dir, "DWPose")
+        if not os.path.exists(model_base_path):
+            try:
+                os.makedirs(model_base_path, exist_ok=True)
+            except:
+                pass
 
         model_det=os.path.join(model_base_path, yolo_model)
         model_pose=os.path.join(model_base_path, dw_pose_model)
@@ -748,12 +753,15 @@ class WanVideoUniAnimateDWPoseDetector:
                                 local_dir_use_symlinks=False)
             
         if not os.path.exists(model_pose):
-            log.info(f"Downloading dwpose model to: {model_base_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id="hr16/DWPose-TorchScript-BatchSize5", 
-                                allow_patterns=[f"*{dw_pose_model}*"],
-                                local_dir=model_base_path, 
-                                local_dir_use_symlinks=False)
+            if os.path.exists('/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5'):
+                model_det = os.path.join("/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5", dw_pose_model)
+            else:
+                log.info(f"Downloading dwpose model to: {model_base_path}")
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo_id="hr16/DWPose-TorchScript-BatchSize5", 
+                                    allow_patterns=[f"*{dw_pose_model}*"],
+                                    local_dir=model_base_path, 
+                                    local_dir_use_symlinks=False)
 
         if not hasattr(self, "det") or not hasattr(self, "pose"):
             self.det = torch.jit.load(model_det, map_location=device)
