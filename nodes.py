@@ -399,7 +399,6 @@ class WanVideoVACEModelSelect:
         return {
             "required": {
                 "vace_model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' VACE model to use when not using model that has it included"}),
-                "vace_blocks": ("STRING", {"default": "0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28", "multiline": True, "tooltip": "Blocks to apply VACE to, default is for 1.3B model"}),
             },
         }
 
@@ -409,10 +408,9 @@ class WanVideoVACEModelSelect:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "VACE model to use when not using model that has it included, loaded from 'ComfyUI/models/diffusion_models'"
 
-    def getvacepath(self, vace_model, vace_blocks):
+    def getvacepath(self, vace_model):
         vace_model = {
             "path": folder_paths.get_full_path("diffusion_models", vace_model),
-            "blocks": [int(x.strip()) for x in vace_blocks.split(",")],
         }
         return (vace_model,)
 
@@ -524,6 +522,9 @@ class WanVideoModelLoader:
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model)
       
         sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+        
+        if "vace_blocks.0.after_proj.weight" in sd and not "patch_embedding.weight" in sd:
+            raise ValueError("You are attempting to load a VACE module as a WanVideo model, instead you should use the vace_model input and matching T2V base model")
 
         if vace_model is not None:
             vace_sd = load_torch_file(vace_model["path"], device=transformer_load_device, safe_load=True)
@@ -558,8 +559,8 @@ class WanVideoModelLoader:
         vace_layers, vace_in_dim = None, None
         if "vace_blocks.0.after_proj.weight" in sd:
             model_type = "t2v"
-            if vace_model is not None:
-                vace_layers = vace_model["blocks"]
+            if dim == 5120:
+                vace_layers = [0, 5, 10, 15, 20, 25, 30, 35]
             else:
                 vace_layers = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
             vace_in_dim = 96
@@ -2401,8 +2402,10 @@ class WanVideoSampler:
             sample_scheduler = FlowMatchLCMScheduler(shift=shift, use_beta_sigmas=(scheduler == 'lcm/beta'))
             sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None)
         elif 'flowmatch_causvid' in scheduler:
+            denoising_list = [999, 934, 862, 756, 603, 410, 250, 140, 74]
             sample_scheduler = FlowMatchScheduler(num_inference_steps=steps, shift=shift, sigma_min=0, extra_one_step=True)
-            sample_scheduler.timesteps = torch.tensor([1000, 934, 862, 756, 603, 410, 250, 140, 74, 0])[:steps].to(device)
+            sample_scheduler.timesteps = torch.tensor(denoising_list)[:steps].to(device)
+            sample_scheduler.sigmas = torch.cat([sample_scheduler.timesteps / 1000, torch.tensor([0.0], device=device)])
         
         if timesteps is None:
             timesteps = sample_scheduler.timesteps
@@ -3325,16 +3328,16 @@ class WanVideoSampler:
                 x0 = latent.to(device)
                 if callback is not None:
                     if recammaster is not None:
-                        callback_latent = (latent_model_input[:, :orig_noise_len] - noise_pred[:, :orig_noise_len].to(t.device) * t / 1000).detach().permute(1,0,2,3)
+                        callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     else:
-                        callback_latent = (latent_model_input.cpu() - noise_pred.cpu() * t.cpu() / 1000).detach().permute(1,0,2,3)
+                        callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     callback(idx, callback_latent, None, steps)
                 else:
                     pbar.update(1)
                 del latent_model_input, timestep
             else:
                 if callback is not None:
-                    callback_latent = (zt_tgt - vt_tgt.to(t.device) * t / 1000).detach().permute(1,0,2,3)
+                    callback_latent = (zt_tgt.to(device) - vt_tgt.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     callback(idx, callback_latent, None, steps)
                 else:
                     pbar.update(1)
