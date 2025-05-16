@@ -745,19 +745,9 @@ class WanVideoModelLoader:
                 
                 del lora_sd
             
-<<<<<<< HEAD
-            
-            if "fast" in quantization:
-                from .fp8_optimization import convert_fp8_linear
-                if quantization == "fp8_e4m3fn_fast_no_ffn":
-                    params_to_keep.update({"ffn"})
-                print(params_to_keep)
-                convert_fp8_linear(patcher.model.diffusion_model, base_dtype, params_to_keep=params_to_keep, sd=sd, device=device)
-=======
             patcher = apply_lora(patcher, device, transformer_load_device, params_to_keep=params_to_keep, dtype=dtype, base_dtype=base_dtype, state_dict=sd, low_mem_load=lora_low_mem_load)
             #patcher.load(device, full_load=True)
             patcher.model.is_patched = True
->>>>>>> ori/main
 
         
         
@@ -834,70 +824,6 @@ class WanVideoModelLoader:
                 gc.collect()
                 mm.soft_empty_cache()
 
-<<<<<<< HEAD
-        elif "torchao" in quantization:
-            try:
-                from torchao.quantization import (
-                quantize_,
-                fpx_weight_only,
-                float8_dynamic_activation_float8_weight,
-                int8_dynamic_activation_int8_weight,
-                int8_weight_only,
-                int4_weight_only
-            )
-            except:
-                raise ImportError("torchao is not installed")
-
-            # def filter_fn(module: nn.Module, fqn: str) -> bool:
-            #     target_submodules = {'attn1', 'ff'} # avoid norm layers, 1.5 at least won't work with quantized norm1 #todo: test other models
-            #     if any(sub in fqn for sub in target_submodules):
-            #         return isinstance(module, nn.Linear)
-            #     return False
-
-            if "fp6" in quantization:
-                quant_func = fpx_weight_only(3, 2)
-            elif "int4" in quantization:
-                quant_func = int4_weight_only()
-            elif "int8" in quantization:
-                quant_func = int8_weight_only()
-            elif "fp8dq" in quantization:
-                quant_func = float8_dynamic_activation_float8_weight()
-            elif 'fp8dqrow' in quantization:
-                from torchao.quantization.quant_api import PerRow
-                quant_func = float8_dynamic_activation_float8_weight(granularity=PerRow())
-            elif 'int8dq' in quantization:
-                quant_func = int8_dynamic_activation_int8_weight()
-
-            log.info(f"Quantizing model with {quant_func}")
-            comfy_model.diffusion_model = transformer
-            patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
-            control_lora = False
-
-            for i, block in enumerate(patcher.model.diffusion_model.blocks):
-                log.info(f"Quantizing block {i}")
-                for name, _ in block.named_parameters(prefix=f"blocks.{i}"):
-                    #print(f"Parameter name: {name}")
-                    set_module_tensor_to_device(patcher.model.diffusion_model, name, device=transformer_load_device, dtype=base_dtype, value=sd[name])
-                if compile_args is not None:
-                    patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-                quantize_(block, quant_func)
-                print(block)
-                #block.to(offload_device)
-            for name, param in patcher.model.diffusion_model.named_parameters():
-                if "blocks" not in name:
-                    set_module_tensor_to_device(patcher.model.diffusion_model, name, device=transformer_load_device, dtype=base_dtype, value=sd[name])
-
-            manual_offloading = False # to disable manual .to(device) calls
-            log.info(f"Quantized transformer blocks to {quantization}")
-            for name, param in patcher.model.diffusion_model.named_parameters():
-                print(name, param.dtype)
-                #param.data = param.data.to(self.vae_dtype).to(device)
-
-            del sd
-            mm.soft_empty_cache()
-
-=======
->>>>>>> ori/main
         patcher.model["dtype"] = base_dtype
         patcher.model["base_path"] = model_path
         patcher.model["model_name"] = model
