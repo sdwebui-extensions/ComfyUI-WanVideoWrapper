@@ -1548,6 +1548,8 @@ class WanVideoImageToVideoEncode:
                 "fun_or_fl2v_model": ("BOOLEAN", {"default": True, "tooltip": "Enable when using official FLF2V or Fun model"}),
                 "temporal_mask": ("MASK", {"tooltip": "mask"}),
                 "extra_latents": ("LATENT", {"tooltip": "Extra latents to add to the input front, used for Skyreels A2 reference images"}),
+                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+
             }
         }
 
@@ -1558,7 +1560,7 @@ class WanVideoImageToVideoEncode:
 
     def process(self, vae, width, height, num_frames, force_offload, noise_aug_strength, 
                 start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, 
-                temporal_mask=None, extra_latents=None, clip_embeds=None):
+                temporal_mask=None, extra_latents=None, clip_embeds=None, tiled_vae=False):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1636,7 +1638,7 @@ class WanVideoImageToVideoEncode:
             temporal_mask = common_upscale(temporal_mask.unsqueeze(1), W, H, "nearest", "disabled").squeeze(1)
             concatenated = resized_start_image[:,:num_frames] * temporal_mask[:num_frames].unsqueeze(0)
 
-        y = vae.encode([concatenated.to(device=device, dtype=vae.dtype)], device, end_=(end_image is not None and not fun_or_fl2v_model))[0]
+        y = vae.encode([concatenated.to(device=device, dtype=vae.dtype)], device, end_=(end_image is not None and not fun_or_fl2v_model),tiled=tiled_vae)[0]
         has_ref = False
         if extra_latents is not None:
             samples = extra_latents["samples"].squeeze(0)
@@ -2349,7 +2351,12 @@ class WanVideoSampler:
             sample_scheduler = FlowMatchLCMScheduler(shift=shift, use_beta_sigmas=(scheduler == 'lcm/beta'))
             sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None)
         elif 'flowmatch_causvid' in scheduler:
-            denoising_list = [999, 934, 862, 756, 603, 410, 250, 140, 74]
+            if transformer.dim == 5120:
+                denoising_list = [999, 934, 862, 756, 603, 410, 250, 140, 74]
+            else:
+                if steps != 3:
+                    raise ValueError("CausVid 1.3B schedule is only for 3 steps")
+                denoising_list = [1000, 757, 522]
             sample_scheduler = FlowMatchScheduler(num_inference_steps=steps, shift=shift, sigma_min=0, extra_one_step=True)
             sample_scheduler.timesteps = torch.tensor(denoising_list)[:steps].to(device)
             sample_scheduler.sigmas = torch.cat([sample_scheduler.timesteps / 1000, torch.tensor([0.0], device=device)])
