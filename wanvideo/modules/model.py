@@ -1217,6 +1217,8 @@ class WanModel(ModelMixin, ConfigMixin):
         audio_proj=None,
         audio_context_lens=None,
         audio_scale=1.0,
+        pcd_data=None,
+        controlnet=None,
         
     ):
         r"""
@@ -1246,7 +1248,7 @@ class WanModel(ModelMixin, ConfigMixin):
            freqs = freqs.to(device)
 
         _, F, H, W = x[0].shape
-
+ 
         # Construct blockwise causal attn mask
         if self.attention_mode == 'flex_attention' and current_step == 0:
             self.block_mask = self._prepare_blockwise_causal_attn_mask(
@@ -1262,6 +1264,12 @@ class WanModel(ModelMixin, ConfigMixin):
                     if random_ref_emb is not None:
                         y[0] = y[0] + random_ref_emb * unianim_data["strength"]
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        
+        #uni3c controlnet
+
+        if pcd_data is not None:
+            hidden_states = x[0].unsqueeze(0).clone().float()
+            render_latent = torch.cat([hidden_states[:, :20], pcd_data["render_latent"]], dim=1)
 
         # embeddings
         if control_lora_enabled:
@@ -1480,6 +1488,17 @@ class WanModel(ModelMixin, ConfigMixin):
                 kwargs['vace_hints'] = vace_hint_list
                 kwargs['vace_context_scale'] = vace_scale_list
 
+            #uni3c controlnet
+            if pcd_data is not None:
+                self.controlnet.to(self.main_device)
+                pdc_controlnet_states = self.controlnet(
+                    render_latent=render_latent.to(self.main_device), 
+                    render_mask=pcd_data["render_mask"], 
+                    camera_embedding=pcd_data["camera_embedding"], 
+                    temb=e.to(self.main_device),
+                    device=self.offload_device)
+                self.controlnet.to(self.offload_device)
+
             for b, block in enumerate(self.blocks):
                 if self.slg_blocks is not None:
                     if b in self.slg_blocks and is_uncond:
@@ -1488,6 +1507,14 @@ class WanModel(ModelMixin, ConfigMixin):
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.main_device)
                 x = block(x, **kwargs)
+
+                #uni3c controlnet
+                if pcd_data is not None:
+                    if b < len(pdc_controlnet_states):
+                        x += pdc_controlnet_states[b].to(x.device)
+                if (controlnet is not None) and (b % controlnet["controlnet_stride"] == 0) and (b // controlnet["controlnet_stride"] < len(controlnet["controlnet_states"])):
+                    x += controlnet["controlnet_states"][b // controlnet["controlnet_stride"]] * controlnet["controlnet_weight"]
+
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.offload_device, non_blocking=self.use_non_blocking)
             

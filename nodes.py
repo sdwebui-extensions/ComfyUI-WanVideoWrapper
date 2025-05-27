@@ -801,28 +801,28 @@ class WanVideoModelLoader:
                 compile_args = compile_args,
             )
 
-            #compile
-            if compile_args is not None and vram_management_args is None:
-                torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-                try:
-                    if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
-                        torch._dynamo.config.recompile_limit = compile_args["dynamo_recompile_limit"]
-                except Exception as e:
-                    log.warning(f"Could not set recompile_limit: {e}")
-                if compile_args["compile_transformer_blocks_only"]:
-                    for i, block in enumerate(patcher.model.diffusion_model.blocks):
-                        patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-                    if vace_layers is not None:
-                        for i, block in enumerate(patcher.model.diffusion_model.vace_blocks):
-                            patcher.model.diffusion_model.vace_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-                else:
-                    patcher.model.diffusion_model = torch.compile(patcher.model.diffusion_model, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])        
-            
-            if load_device == "offload_device" and patcher.model.diffusion_model.device != offload_device:
-                log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
-                patcher.model.diffusion_model.to(offload_device)
-                gc.collect()
-                mm.soft_empty_cache()
+        #compile
+        if compile_args is not None and vram_management_args is None:
+            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+            try:
+                if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
+                    torch._dynamo.config.recompile_limit = compile_args["dynamo_recompile_limit"]
+            except Exception as e:
+                log.warning(f"Could not set recompile_limit: {e}")
+            if compile_args["compile_transformer_blocks_only"]:
+                for i, block in enumerate(patcher.model.diffusion_model.blocks):
+                    patcher.model.diffusion_model.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+                if vace_layers is not None:
+                    for i, block in enumerate(patcher.model.diffusion_model.vace_blocks):
+                        patcher.model.diffusion_model.vace_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+            else:
+                patcher.model.diffusion_model = torch.compile(patcher.model.diffusion_model, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])        
+        
+        if load_device == "offload_device" and patcher.model.diffusion_model.device != offload_device:
+            log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
+            patcher.model.diffusion_model.to(offload_device)
+            gc.collect()
+            mm.soft_empty_cache()
 
         patcher.model["dtype"] = base_dtype
         patcher.model["base_path"] = model_path
@@ -2258,7 +2258,7 @@ class WanVideoSampler:
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
-                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "deis", "lcm", "lcm/beta", "flowmatch_causvid"],
+                "scheduler": (["unipc", "unipc/beta", "dpm++", "dpm++/beta","dpm++_sde", "dpm++_sde/beta", "euler", "euler/beta", "euler/accvideo", "deis", "lcm", "lcm/beta", "flowmatch_causvid"],
                     {
                         "default": 'unipc'
                     }),
@@ -2273,7 +2273,7 @@ class WanVideoSampler:
                 "context_options": ("WANVIDCONTEXT", ),
                 "teacache_args": ("TEACACHEARGS", ),
                 "flowedit_args": ("FLOWEDITARGS", ),
-                "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batc cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
+                "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batch cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
                 "slg_args": ("SLGARGS", ),
                 "rope_function": (["default", "comfy"], {"default": "comfy", "tooltip": "Comfy's RoPE implementation doesn't use complex numbers and can thus be compiled, that should be a lot faster when using torch.compile"}),
                 "loop_args": ("LOOPARGS", ),
@@ -2283,6 +2283,7 @@ class WanVideoSampler:
                 "sigmas": ("SIGMAS", ),
                 "unianimate_poses": ("UNIANIMATE_POSE", ),
                 "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
+                "uni3c_embeds": ("UNI3C_EMBEDS", ),
             }
         }
 
@@ -2295,7 +2296,7 @@ class WanVideoSampler:
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
         teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, 
         nocfg_begin=1.0, nocfg_end=1.0, 
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -2332,7 +2333,16 @@ class WanVideoSampler:
             if flowedit_args: #seems to work better
                 timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=get_sampling_sigmas(steps, shift))
             else:
-                sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None) 
+                sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None)
+        elif scheduler in ['euler/accvideo']:
+            if steps != 50:
+                raise Exception("Steps must be set to 50 for accvideo scheduler, 10 actual steps are used")
+            sample_scheduler = FlowMatchEulerDiscreteScheduler(shift=shift, use_beta_sigmas=(scheduler == 'euler/beta'))
+            sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas.tolist() if sigmas is not None else None)
+            start_latent_list = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+            sample_scheduler.sigmas = sample_scheduler.sigmas[start_latent_list]
+            steps = len(start_latent_list) - 1
+            sample_scheduler.timesteps = timesteps = sample_scheduler.timesteps[start_latent_list[:steps]]
         elif 'dpm++' in scheduler:
             if 'sde' in scheduler:
                 algorithm_type = "sde-dpmsolver++"
@@ -2365,7 +2375,7 @@ class WanVideoSampler:
         
         if timesteps is None:
             timesteps = sample_scheduler.timesteps
-            print("timesteps: ", timesteps)
+        log.info(f"timesteps: {timesteps}")
         
         if denoise_strength < 1.0:
             steps = int(steps * denoise_strength)
@@ -2702,6 +2712,29 @@ class WanVideoSampler:
                     module.onload()
         elif model["manual_offloading"]:
             transformer.to(device)
+
+        #controlnet
+        controlnet_latents = controlnet = None
+        if transformer_options is not None:
+            controlnet = transformer_options.get("controlnet", None)
+            if controlnet is not None:
+                self.controlnet = controlnet["controlnet"]
+                controlnet_start = controlnet["controlnet_start"]
+                controlnet_end = controlnet["controlnet_end"]
+                controlnet_latents = controlnet["control_latents"]
+                controlnet["controlnet_weight"] = controlnet["controlnet_strength"]
+                controlnet["controlnet_stride"] = controlnet["control_stride"]
+
+        #uni3c
+        pcd_data = None
+        if uni3c_embeds is not None:
+            transformer.controlnet = uni3c_embeds["controlnet"]
+            pcd_data = {
+                "render_latent": uni3c_embeds["render_latent"],
+                "render_mask": uni3c_embeds["render_mask"],
+                "camera_embedding": uni3c_embeds["camera_embedding"],
+            }
+
         #feta
         if feta_args is not None and latent_video_length > 1:
             set_enhance_weight(feta_args["weight"])
@@ -2865,6 +2898,21 @@ class WanVideoSampler:
                             teacache_state.append(None)
                 if not use_phantom:
                     z_pos = z_neg = z
+
+                if controlnet_latents is not None:
+                    if (controlnet_start <= current_step_percentage < controlnet_end):
+                        controlnet_states = self.controlnet(
+                            hidden_states=latent_model_input.unsqueeze(0).to(self.controlnet.dtype),
+                            timestep=timestep,
+                            encoder_hidden_states=positive_embeds[0].unsqueeze(0).to(self.controlnet.dtype),
+                            attention_kwargs=None,
+                            controlnet_states=controlnet_latents.to(self.controlnet.dtype).to(self.controlnet.device),
+                            return_dict=False,
+                        )[0]
+                        if isinstance(controlnet_states, (tuple, list)):
+                            controlnet["controlnet_states"] = [x.to(latent_model_input) for x in controlnet_states]
+                        else:
+                            controlnet["controlnet_states"] = controlnet_states.to(latent_model_input)
                  
                 base_params = {
                     'seq_len': seq_len,
@@ -2880,6 +2928,8 @@ class WanVideoSampler:
                     'audio_proj': audio_proj if fantasytalking_embeds is not None else None,
                     'audio_context_lens': audio_context_lens if fantasytalking_embeds is not None else None,
                     'audio_scale': audio_scale if fantasytalking_embeds is not None else None,
+                    "pcd_data": pcd_data,
+                    "controlnet": controlnet
                 }
 
                 batch_size = 1
