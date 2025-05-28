@@ -2318,6 +2318,11 @@ class WanVideoSampler:
         
         steps = int(steps/denoise_strength)
 
+        if isinstance(cfg, list):
+            if steps != len(cfg):
+                log.info(f"Received {len(cfg)} cfg values, but only {steps} steps. Setting step count to match.")
+                steps = len(cfg)
+
         timesteps = None
         if 'unipc' in scheduler:
             sample_scheduler = FlowUniPCMultistepScheduler(shift=shift)
@@ -2523,6 +2528,8 @@ class WanVideoSampler:
 
             phantom_latents = image_embeds.get("phantom_latents", None)
             phantom_cfg_scale = image_embeds.get("phantom_cfg_scale", None)
+            if not isinstance(phantom_cfg_scale, list):
+                phantom_cfg_scale = [phantom_cfg_scale] * (steps +1)
             phantom_start_percent = image_embeds.get("phantom_start_percent", 0.0)
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
             if phantom_latents is not None:
@@ -2970,7 +2977,7 @@ class WanVideoSampler:
                     )
                     noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
                     #phantom
-                    if use_phantom:
+                    if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
                         noise_pred_phantom, teacache_state_phantom = transformer(
                         [z_phantom_img], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
                         y=[image_cond_input] if image_cond_input is not None else None, 
@@ -2981,7 +2988,7 @@ class WanVideoSampler:
                     )
                         noise_pred_phantom = noise_pred_phantom[0].to(intermediate_device)
                         
-                        noise_pred = noise_pred_uncond + phantom_cfg_scale * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
+                        noise_pred = noise_pred_uncond + phantom_cfg_scale[idx] * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
                         return noise_pred, [teacache_state_cond, teacache_state_uncond, teacache_state_phantom]
                     #fantasytalking
                     if fantasytalking_embeds is not None:
@@ -3350,6 +3357,8 @@ class WanVideoSampler:
                 if callback is not None:
                     if recammaster is not None:
                         callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
+                    if phantom_latents is not None:
+                        callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     else:
                         callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     callback(idx, callback_latent, None, steps)
