@@ -167,23 +167,37 @@ class WanVideoModelConfig:
         self.latent_format.latent_channels = 16
         self.manual_cast_dtype = dtype
         self.sampling_settings = {"multiplier": 1.0}
-        # Don't know what this is. Value taken from ComfyUI Mochi model.
         self.memory_usage_factor = 2.0
-        # denoiser is handled by extension
         self.unet_config["disable_unet_model_creation"] = True
 
-def filter_state_dict_by_blocks(state_dict, blocks_mapping):
+def filter_state_dict_by_blocks(state_dict, blocks_mapping, layer_filter=[]):
     filtered_dict = {}
 
-    for key in state_dict:
-        if 'blocks.' in key:
-            block_pattern = key.split('diffusion_model.')[1].split('.', 2)[0:2]
-            block_key = f'{block_pattern[0]}.{block_pattern[1]}.'
+    if isinstance(layer_filter, str):
+        layer_filters = [layer_filter] if layer_filter else []
+    else:
+        # Filter out empty strings
+        layer_filters = [f for f in layer_filter if f] if layer_filter else []
 
-            if block_key in blocks_mapping:
+    print("layer_filter: ", layer_filters)
+
+    for key in state_dict:
+        if not any(filter_str in key for filter_str in layer_filters):
+            if 'blocks.' in key:
+                
+                block_pattern = key.split('diffusion_model.')[1].split('.', 2)[0:2]
+                block_key = f'{block_pattern[0]}.{block_pattern[1]}.'
+
+                if block_key in blocks_mapping:
+                    filtered_dict[key] = state_dict[key]
+            else:
                 filtered_dict[key] = state_dict[key]
-        else:
-            filtered_dict[key] = state_dict[key]
+    
+    for key in filtered_dict:
+        print(key)
+
+    from safetensors.torch import save_file
+    save_file(filtered_dict, "filtered_state_dict_2.safetensors")
 
     return filtered_dict
 
@@ -377,14 +391,15 @@ class WanVideoLoraSelect:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Select a LoRA model from ComfyUI/models/loras"
 
-    def getlorapath(self, lora, strength, blocks=None, prev_lora=None, low_mem_load=False):
+    def getlorapath(self, lora, strength, blocks={}, prev_lora=None, low_mem_load=False):
         loras_list = []
 
         lora = {
             "path": folder_paths.get_full_path("loras", lora),
             "strength": strength,
             "name": lora.split(".")[0],
-            "blocks": blocks,
+            "blocks": blocks.get("selected_blocks", {}),
+            "layer_filter": blocks.get("layer_filter", ""),
             "low_mem_load": low_mem_load,
         }
         if prev_lora is not None:
@@ -426,7 +441,7 @@ class WanVideoLoraBlockEdit:
         for i in range(40):
             arg_dict["blocks.{}.".format(i)] = argument
 
-        return {"required": arg_dict}
+        return {"required": arg_dict, "optional": {"layer_filter": ("STRING", {"default": "", "multiline": True})}}
 
     RETURN_TYPES = ("SELECTEDBLOCKS", )
     RETURN_NAMES = ("blocks", )
@@ -435,10 +450,14 @@ class WanVideoLoraBlockEdit:
 
     CATEGORY = "WanVideoWrapper"
 
-    def select(self, **kwargs):
+    def select(self, layer_filter=[], **kwargs):
         selected_blocks = {k: v for k, v in kwargs.items() if v is True and isinstance(v, bool)}
         print("Selected blocks LoRA: ", selected_blocks)
-        return (selected_blocks,)
+        selected = {
+            "selected_blocks": selected_blocks,
+            "layer_filter": [x.strip() for x in layer_filter.split(",")]
+        }
+        return (selected,)
 
 #region Model loading
 class WanVideoModelLoader:
@@ -710,7 +729,7 @@ class WanVideoModelLoader:
 
                 lora_sd = standardize_lora_key_format(lora_sd)
                 if l["blocks"]:
-                    lora_sd = filter_state_dict_by_blocks(lora_sd, l["blocks"])
+                    lora_sd = filter_state_dict_by_blocks(lora_sd, l["blocks"], l.get("layer_filter", []))
 
                 #spacepxl's control LoRA patch
                 # for key in lora_sd.keys():
@@ -2317,6 +2336,8 @@ class WanVideoSampler:
         dtype = model["dtype"]
         control_lora = model["control_lora"]
 
+        transformer_options = patcher.model_options.get("transformer_options", None)
+
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         
@@ -2400,8 +2421,22 @@ class WanVideoSampler:
         fun_ref_image = None
 
         image_cond = image_embeds.get("image_embeds", None)
+        ATI_tracks = None
        
         if image_cond is not None:
+            log.info(f"image_cond shape: {image_cond.shape}")
+            #ATI tracks
+            if transformer_options is not None:
+                ATI_tracks = transformer_options.get("ati_tracks", None)
+                if ATI_tracks is not None:
+                    from .ATI.motion_patch import patch_motion
+                    topk = transformer_options.get("ati_topk", 2)
+                    temperature = transformer_options.get("ati_temperature", 220.0)
+                    ati_start_percent = transformer_options.get("ati_start_percentage", 0.0)
+                    ati_end_percent = transformer_options.get("ati_end_percentage", 1.0)
+                    image_cond_ati = patch_motion(ATI_tracks.to(image_cond.device, image_cond.dtype), image_cond, topk=topk, temperature=temperature)
+                    log.info(f"ATI tracks shape: {ATI_tracks.shape}")
+
             end_image = image_embeds.get("end_image", None)
             lat_h = image_embeds.get("lat_h", None)
             lat_w = image_embeds.get("lat_w", None)
@@ -2417,8 +2452,7 @@ class WanVideoSampler:
                 generator=seed_g,
                 device=torch.device("cpu"))
             seq_len = image_embeds["max_seq_len"]
-            image_cond = image_embeds.get("image_embeds", None)
-            print("image_cond", image_cond.shape)
+            
             clip_fea = image_embeds.get("clip_context", None)
             if clip_fea is not None:
                 clip_fea = clip_fea.to(dtype)
@@ -2692,7 +2726,6 @@ class WanVideoSampler:
         callback = prepare_callback(patcher, steps)
 
         #blockswap init        
-        transformer_options = patcher.model_options.get("transformer_options", None)
         if transformer_options is not None:
             block_swap_args = transformer_options.get("block_swap_args", None)
 
@@ -2744,6 +2777,9 @@ class WanVideoSampler:
                 "render_latent": uni3c_embeds["render_latent"],
                 "render_mask": uni3c_embeds["render_mask"],
                 "camera_embedding": uni3c_embeds["camera_embedding"],
+                "controlnet_weight": uni3c_embeds["controlnet_weight"],
+                "start": uni3c_embeds["start"],
+                "end": uni3c_embeds["end"],
             }
 
         #feta
@@ -2883,7 +2919,11 @@ class WanVideoSampler:
                             if not patcher.model.is_patched:
                                 log.info("Loading LoRA...")
                                 patcher = apply_lora(patcher, device, device, low_mem_load=False)
-                                patcher.model.is_patched = True                   
+                                patcher.model.is_patched = True
+                elif ATI_tracks is not None:
+                    if (ati_start_percent <= current_step_percentage <= ati_end_percent) or \
+                        (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent):
+                        image_cond_input = image_cond_ati.to(z)
                 else:
                     image_cond_input = image_cond.to(z) if image_cond is not None else None
 
@@ -2912,12 +2952,13 @@ class WanVideoSampler:
 
                 if controlnet_latents is not None:
                     if (controlnet_start <= current_step_percentage < controlnet_end):
+                        self.controlnet.to(device)
                         controlnet_states = self.controlnet(
-                            hidden_states=latent_model_input.unsqueeze(0).to(self.controlnet.dtype),
+                            hidden_states=latent_model_input.unsqueeze(0).to(device, self.controlnet.dtype),
                             timestep=timestep,
-                            encoder_hidden_states=positive_embeds[0].unsqueeze(0).to(self.controlnet.dtype),
+                            encoder_hidden_states=positive_embeds[0].unsqueeze(0).to(device, self.controlnet.dtype),
                             attention_kwargs=None,
-                            controlnet_states=controlnet_latents.to(self.controlnet.dtype).to(self.controlnet.device),
+                            controlnet_states=controlnet_latents.to(device, self.controlnet.dtype),
                             return_dict=False,
                         )[0]
                         if isinstance(controlnet_states, (tuple, list)):
@@ -3361,7 +3402,7 @@ class WanVideoSampler:
                 if callback is not None:
                     if recammaster is not None:
                         callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
-                    if phantom_latents is not None:
+                    elif phantom_latents is not None:
                         callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                     else:
                         callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
@@ -3493,14 +3534,16 @@ class WanVideoDecode:
 
         #if is_looped:
         #   latents = torch.cat([latents[:, :, :warmup_latent_count],latents], dim=2)
-
-        if isinstance(vae, TAEHV):            
+        if type(vae).__name__ == "TAEHV":      
             images = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
+            images = torch.clamp(images, 0.0, 1.0)
+            images = images.permute(1, 2, 3, 0).cpu().float()
+            return (images,)
         else:
             if end_image is not None:
                 enable_vae_tiling = False
             images = vae.decode(latents, device=device, end_=(end_image is not None), tiled=enable_vae_tiling, tile_size=(tile_x//8, tile_y//8), tile_stride=(tile_stride_x//8, tile_stride_y//8))[0]
-        vae.model.clear_cache()
+            vae.model.clear_cache()
 
         images = (images - images.min()) / (images.max() - images.min())      
 
