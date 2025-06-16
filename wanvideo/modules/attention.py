@@ -54,6 +54,18 @@ __all__ = [
 
 from einops import rearrange
 from flash_attn import flash_attn_func
+
+def natten_attention(query, key, value, grid_sizes):
+    import natten
+    num_frames, height, width = grid_sizes[0][0], grid_sizes[0][1], grid_sizes[0][2]
+    mode = "bs (f h w) hn hd -> bs h w f hn hd"
+    query = rearrange(query, mode, f=num_frames, h=height, w=width)
+    key = rearrange(key, mode, f=num_frames, h=height, w=width)
+    value = rearrange(value, mode, f=num_frames, h=height, w=width)
+    attn = natten.na3d(query, key, value, backend="cutlass-fna", kernel_size=(32, 32, num_frames), stride=(16, 16, min(num_frames, 16)))
+    attn = rearrange(attn, "bs h w f hn hd -> bs (f h w) hn hd", f=num_frames, h=height, w=width)
+    return attn
+
 def swa_flash_attention(query, key, value, grid_sizes, windows_size=4096):
     out_dtype = query.dtype
     num_frames, height, width = grid_sizes[0][0], grid_sizes[0][1], grid_sizes[0][2]
