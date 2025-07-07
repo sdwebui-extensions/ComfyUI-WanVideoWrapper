@@ -3,7 +3,6 @@ from einops import rearrange, repeat
 import torch
 import torch.nn as nn
 from functools import lru_cache
-from ..wanvideo.modules.attention import attention
 
 from comfy import model_management as mm
 
@@ -253,6 +252,8 @@ class SingleStreamAttention(nn.Module):
         self.attention_mode = attention_mode
 
     def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False, kv_seq=None) -> torch.Tensor:
+
+        from ..wanvideo.modules.attention import attention
        
         N_t, N_h, N_w = shape
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
@@ -354,6 +355,8 @@ class SingleStreamMultiAttention(SingleStreamAttention):
                 x_ref_attn_map=None,
         human_num=None,
     ) -> torch.Tensor:
+        
+        from ..wanvideo.modules.attention import attention
         
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
 
