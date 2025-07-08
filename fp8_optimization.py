@@ -11,7 +11,7 @@ def fp8_linear_forward(cls, original_dtype, input):
             inn = input.reshape(-1, input.shape[2]).to(weight_dtype)
             w = cls.weight.t()
 
-            scale = cls.scale_weight
+            scale = cls.scale_weight.to(inn.device)
             bias = cls.bias.to(original_dtype) if cls.bias is not None else None
 
             if bias is not None:
