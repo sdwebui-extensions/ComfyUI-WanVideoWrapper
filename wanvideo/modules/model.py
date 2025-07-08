@@ -104,7 +104,6 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
 
 from comfy.model_management import get_torch_device, get_autocast_device
 @torch.autocast(device_type=get_autocast_device(get_torch_device()), enabled=False)
-@torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
