@@ -1639,7 +1639,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if should_calc:
             if self.enable_teacache or self.enable_magcache:
-                original_x = x.to(self.cache_device).clone()
+                original_x = x.to(self.cache_device, non_blocking=True, copy=True) # .clone()
 
             if hasattr(self, "dwpose_embedding") and unianim_data is not None:
                 if unianim_data['start_percent'] <= current_step_percentage <= unianim_data['end_percent']:
