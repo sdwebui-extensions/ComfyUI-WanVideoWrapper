@@ -52,13 +52,17 @@ class DownloadAndLoadWav2VecModel:
         model_path = os.path.join(folder_paths.models_dir, "transformers", model)
         if not os.path.exists(model_path):
             log.info(f"Downloading Qwen model to: {model_path}")
-            if os.path.exists("/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h"):
+            from huggingface_hub import snapshot_download
+            ignore_patterns = None
+            if model == "facebook/wav2vec2-base-960h":
+                ignore_patterns = ["*.bin", "*.h5"]
+            elif model == "TencentGameMate/chinese-wav2vec2-base":
+                ignore_patterns = ["*.pt"]
+            if os.path.exists("/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h") and model == "facebook/wav2vec2-base-960h":
                 model_path = "/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h"
+            elif os.path.exists("/stable-diffusion-cache/huggingface/TencentGameMate/chinese-wav2vec2-base") and model == "TencentGameMate/chinese-wav2vec2-base":
+                model_path = "/stable-diffusion-cache/huggingface/TencentGameMate/chinese-wav2vec2-base"
             else:
-                from huggingface_hub import snapshot_download
-                ignore_patterns = None
-                if model == "facebook/wav2vec2-base-960h":
-                    ignore_patterns = ["*.bin", "*.h5"]
                 snapshot_download(
                     repo_id=model,
                     ignore_patterns=ignore_patterns,
@@ -177,7 +181,9 @@ class FantasyTalkingWav2VecEmbeds:
             audio_segment.numpy(), sampling_rate=sr, return_tensors="pt"
         ).input_values.to(dtype).to(device)
 
+        wav2vec.to(device)
         audio_features = wav2vec(input_values).last_hidden_state
+        wav2vec.to(offload_device)
 
         audio_proj_model.proj_model.to(device)
         audio_proj_fea = audio_proj_model.get_proj_fea(audio_features)
