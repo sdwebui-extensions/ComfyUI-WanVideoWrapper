@@ -1,31 +1,166 @@
 {
   "id": "206247b6-9fec-4ed2-8927-e4f388c674d4",
   "revision": 0,
-  "last_node_id": 67,
-  "last_link_id": 84,
+  "last_node_id": 69,
+  "last_link_id": 89,
   "nodes": [
     {
-      "id": 42,
-      "type": "Note",
+      "id": 46,
+      "type": "WanVideoTextEmbedBridge",
       "pos": [
-        -580,
-        -760
+        919.7472534179688,
+        822.0996704101562
       ],
       "size": [
-        314.96246337890625,
-        152.77333068847656
+        315,
+        46
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 54
+        },
+        {
+          "name": "negative",
+          "shape": 7,
+          "type": "CONDITIONING",
+          "link": 55
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text_embeds",
+          "type": "WANVIDEOTEXTEMBEDS",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoTextEmbedBridge"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 50,
+      "type": "CLIPTextEncode",
+      "pos": [
+        469.7478332519531,
+        1082.099609375
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 53
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            55
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.26",
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+      ]
+    },
+    {
+      "id": 48,
+      "type": "CLIPLoader",
+      "pos": [
+        109.74829864501953,
+        832.0996704101562
+      ],
+      "size": [
+        315,
+        106
       ],
       "flags": {},
       "order": 0,
-      "mode": 0,
+      "mode": 2,
       "inputs": [],
-      "outputs": [],
-      "properties": {},
-      "widgets_values": [
-        "Adjust the blocks to swap based on your VRAM, this is a tradeoff between speed and memory usage.\n\nAlternatively there's option to use VRAM management introduced in DiffSynt-Studios. This is usually slower, but saves even more VRAM compared to BlockSwap"
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            52,
+            53
+          ]
+        }
       ],
-      "color": "#432",
-      "bgcolor": "#653"
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.26",
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "umt5_xxl_fp16.safetensors",
+        "wan",
+        "default"
+      ]
+    },
+    {
+      "id": 49,
+      "type": "CLIPTextEncode",
+      "pos": [
+        469.7478332519531,
+        832.0996704101562
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 52
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            54
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.26",
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "high quality nature video featuring a red panda balancing on a bamboo stem while a bird lands on it's head, on the background there is a waterfall"
+      ]
     },
     {
       "id": 36,
@@ -74,6 +209,7 @@
       "bgcolor": "#653"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 62,
       "type": "Note",
       "pos": [
@@ -83,6 +219,17 @@
       "size": [
         268.73455810546875,
         90.03050994873047
+=======
+      "id": 51,
+      "type": "Note",
+      "pos": [
+        139.7482452392578,
+        662.0992431640625
+      ],
+      "size": [
+        253.16725158691406,
+        88
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 3,
@@ -91,12 +238,17 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         "The original code had automatic resolution adjustment based on input image total pixels  and aspect ratio. If you want to set it manually, disable the adjust_resolution"
+=======
+        "You can also use native ComfyUI text encoding with these nodes instead of the original, the models are node specific and can't otherwise be mixed."
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "color": "#432",
       "bgcolor": "#653"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 11,
       "type": "LoadWanVideoT5TextEncoder",
       "pos": [
@@ -183,11 +335,23 @@
       "size": [
         327.61932373046875,
         88
+=======
+      "id": 39,
+      "type": "WanVideoBlockSwap",
+      "pos": [
+        -210,
+        -760
+      ],
+      "size": [
+        315,
+        154
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 4,
       "mode": 0,
       "inputs": [],
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "outputs": [],
       "properties": {},
       "widgets_values": [
@@ -206,11 +370,49 @@
       "size": [
         324.64129638671875,
         159.47401428222656
+=======
+      "outputs": [
+        {
+          "name": "block_swap_args",
+          "type": "BLOCKSWAPARGS",
+          "slot_index": 0,
+          "links": [
+            50
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoBlockSwap"
+      },
+      "widgets_values": [
+        10,
+        false,
+        false,
+        true,
+        0
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 35,
+      "type": "WanVideoTorchCompileSettings",
+      "pos": [
+        -276.8500671386719,
+        -1050.6326904296875
+      ],
+      "size": [
+        390.5999755859375,
+        202
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 5,
       "mode": 0,
       "inputs": [],
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "outputs": [],
       "properties": {},
       "widgets_values": [
@@ -229,11 +431,49 @@
       "size": [
         303.0501403808594,
         88
+=======
+      "outputs": [
+        {
+          "name": "torch_compile_args",
+          "type": "WANCOMPILEARGS",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoTorchCompileSettings"
+      },
+      "widgets_values": [
+        "inductor",
+        false,
+        "default",
+        false,
+        64,
+        true,
+        128
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 59,
+      "type": "CLIPVisionLoader",
+      "pos": [
+        -583.8698120117188,
+        -168.6510009765625
+      ],
+      "size": [
+        315,
+        58
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 6,
       "mode": 0,
       "inputs": [],
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "outputs": [],
       "properties": {},
       "widgets_values": [
@@ -323,10 +563,19 @@
           "type": "WANVIDIMAGE_EMBEDS",
           "links": [
             66
+=======
+      "outputs": [
+        {
+          "name": "CLIP_VISION",
+          "type": "CLIP_VISION",
+          "links": [
+            70
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
           ]
         }
       ],
       "properties": {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         "Node name for S&R": "WanVideoImageToVideoEncode",
         "cnr_id": "ComfyUI-WanVideoWrapper",
         "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50"
@@ -343,6 +592,17 @@
       ],
       "color": "#2a363b",
       "bgcolor": "#3f5159"
+=======
+        "cnr_id": "comfy-core",
+        "ver": "0.3.26",
+        "Node name for S&R": "CLIPVisionLoader"
+      },
+      "widgets_values": [
+        "clip_vision_h.safetensors"
+      ],
+      "color": "#233",
+      "bgcolor": "#355"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
     },
     {
       "id": 16,
@@ -356,7 +616,11 @@
         261.5306701660156
       ],
       "flags": {},
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "order": 17,
+=======
+      "order": 20,
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "mode": 0,
       "inputs": [
         {
@@ -406,6 +670,7 @@
       "bgcolor": "#593930"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 27,
       "type": "WanVideoSampler",
       "pos": [
@@ -563,6 +828,8 @@
       ]
     },
     {
+=======
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "id": 30,
       "type": "VHS_VideoCombine",
       "pos": [
@@ -571,10 +838,14 @@
       ],
       "size": [
         1245.8460693359375,
-        1573.8460693359375
+        334
       ],
       "flags": {},
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "order": 21,
+=======
+      "order": 24,
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "mode": 0,
       "inputs": [
         {
@@ -652,10 +923,14 @@
       ],
       "size": [
         315,
-        174
+        198
       ],
       "flags": {},
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "order": 20,
+=======
+      "order": 23,
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "mode": 0,
       "inputs": [
         {
@@ -692,7 +967,12 @@
         272,
         272,
         144,
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         128
+=======
+        128,
+        "default"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "color": "#322",
       "bgcolor": "#533"
@@ -709,7 +989,11 @@
         262
       ],
       "flags": {},
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "order": 16,
+=======
+      "order": 19,
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "mode": 0,
       "inputs": [
         {
@@ -722,7 +1006,7 @@
           "label": "image_1",
           "name": "image_1",
           "type": "IMAGE",
-          "link": 73
+          "link": 85
         },
         {
           "label": "image_2",
@@ -767,27 +1051,73 @@
       "bgcolor": "#355"
     },
     {
-      "id": 66,
-      "type": "ImageResizeKJ",
+      "id": 58,
+      "type": "LoadImage",
       "pos": [
-        -175.95899963378906,
-        176.40057373046875
+        -650.719482421875,
+        173.7036895751953
       ],
       "size": [
-        315,
-        266
+        413.10479736328125,
+        498.3180847167969
       ],
       "flags": {},
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "order": 14,
+=======
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            84
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.26",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "oldman_upscaled.png",
+        "image"
+      ],
+      "color": "#2a363b",
+      "bgcolor": "#3f5159"
+    },
+    {
+      "id": 68,
+      "type": "ImageResizeKJv2",
+      "pos": [
+        -153.1925811767578,
+        172.66262817382812
+      ],
+      "size": [
+        270,
+        336
+      ],
+      "flags": {},
+      "order": 16,
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "mode": 0,
       "inputs": [
         {
           "label": "图像",
           "name": "image",
           "type": "IMAGE",
-          "link": 72
+          "link": 84
         },
         {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
           "label": "参考图像",
           "name": "get_image_size",
           "shape": 7,
@@ -812,6 +1142,11 @@
           "widget": {
             "name": "height_input"
           },
+=======
+          "name": "mask",
+          "shape": 7,
+          "type": "MASK",
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
           "link": null
         }
       ],
@@ -821,8 +1156,8 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            73,
-            83
+            85,
+            86
           ]
         },
         {
@@ -830,7 +1165,7 @@
           "name": "width",
           "type": "INT",
           "links": [
-            75
+            87
           ]
         },
         {
@@ -838,27 +1173,39 @@
           "name": "height",
           "type": "INT",
           "links": [
-            76
+            88
           ]
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
         }
       ],
       "properties": {
         "Node name for S&R": "ImageResizeKJ",
         "cnr_id": "comfyui-kjnodes",
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         "ver": "52c2e31a903fec2dd654fb614ea82ba2757d5028"
+=======
+        "ver": "ad37ce656c13e9abea002b46e3a89be3dba32355",
+        "Node name for S&R": "ImageResizeKJv2"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       },
       "widgets_values": [
         624,
         624,
         "lanczos",
-        false,
+        "crop",
+        "0, 0, 0",
+        "center",
         16,
-        0,
-        0,
-        "disabled"
+        "cpu",
+        "<tr><td>Output: </td><td><b>1</b> x <b>624</b> x <b>624 | 4.46MB</b></td></tr>"
       ]
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 58,
       "type": "LoadImage",
       "pos": [
@@ -868,6 +1215,17 @@
       "size": [
         413.10479736328125,
         498.3180847167969
+=======
+      "id": 45,
+      "type": "WanVideoVRAMManagement",
+      "pos": [
+        -206.39657592773438,
+        -531.3529663085938
+      ],
+      "size": [
+        315,
+        58
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 8,
@@ -875,6 +1233,7 @@
       "inputs": [],
       "outputs": [
         {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
           "label": "图像",
           "name": "IMAGE",
           "type": "IMAGE",
@@ -898,11 +1257,133 @@
         "000.jpg",
         "image",
         ""
+=======
+          "name": "vram_management_args",
+          "type": "VRAM_MANAGEMENTARGS",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoVRAMManagement"
+      },
+      "widgets_values": [
+        1
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 63,
+      "type": "WanVideoImageToVideoEncode",
+      "pos": [
+        312.583251953125,
+        -87.46442413330078
+      ],
+      "size": [
+        352.79998779296875,
+        390
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae",
+          "type": "WANVAE",
+          "link": 81
+        },
+        {
+          "name": "clip_embeds",
+          "shape": 7,
+          "type": "WANVIDIMAGE_CLIPEMBEDS",
+          "link": 82
+        },
+        {
+          "name": "start_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 86
+        },
+        {
+          "name": "end_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "control_embeds",
+          "shape": 7,
+          "type": "WANVIDIMAGE_EMBEDS",
+          "link": null
+        },
+        {
+          "name": "temporal_mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "extra_latents",
+          "shape": 7,
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "add_cond_latents",
+          "shape": 7,
+          "type": "ADD_COND_LATENTS",
+          "link": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 87
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 88
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image_embeds",
+          "type": "WANVIDIMAGE_EMBEDS",
+          "links": [
+            66
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoImageToVideoEncode"
+      },
+      "widgets_values": [
+        832,
+        480,
+        81,
+        0.030000000000000006,
+        1,
+        1,
+        true,
+        false,
+        false
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "color": "#2a363b",
       "bgcolor": "#3f5159"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 59,
       "type": "CLIPVisionLoader",
       "pos": [
@@ -912,6 +1393,17 @@
       "size": [
         315,
         58
+=======
+      "id": 11,
+      "type": "LoadWanVideoT5TextEncoder",
+      "pos": [
+        172.5333709716797,
+        -444.4674987792969
+      ],
+      "size": [
+        377.1661376953125,
+        130
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 9,
@@ -919,6 +1411,7 @@
       "inputs": [],
       "outputs": [
         {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
           "label": "CLIP视觉",
           "name": "CLIP_VISION",
           "type": "CLIP_VISION",
@@ -995,6 +1488,8 @@
       "outputs": [
         {
           "label": "wan_t5_model",
+=======
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
           "name": "wan_t5_model",
           "type": "WANTEXTENCODER",
           "slot_index": 0,
@@ -1004,9 +1499,15 @@
         }
       ],
       "properties": {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         "Node name for S&R": "LoadWanVideoT5TextEncoder",
         "cnr_id": "ComfyUI-WanVideoWrapper",
         "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50"
+=======
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "LoadWanVideoT5TextEncoder"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       },
       "widgets_values": [
         "umt5-xxl-enc-bf16.safetensors",
@@ -1018,6 +1519,47 @@
       "bgcolor": "#593930"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
+=======
+      "id": 38,
+      "type": "WanVideoVAELoader",
+      "pos": [
+        173.75848388671875,
+        -263.48968505859375
+      ],
+      "size": [
+        372.7727966308594,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "WANVAE",
+          "slot_index": 0,
+          "links": [
+            43,
+            81
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoVAELoader"
+      },
+      "widgets_values": [
+        "wanvideo\\Wan2_1_VAE_bf16.safetensors",
+        "bf16"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       "id": 22,
       "type": "WanVideoModelLoader",
       "pos": [
@@ -1026,6 +1568,7 @@
       ],
       "size": [
         477.4410095214844,
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         226.43276977539062
       ],
       "flags": {},
@@ -1055,15 +1598,66 @@
         },
         {
           "label": "vram_management_args",
+=======
+        274
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "compile_args",
+          "shape": 7,
+          "type": "WANCOMPILEARGS",
+          "link": null
+        },
+        {
+          "name": "block_swap_args",
+          "shape": 7,
+          "type": "BLOCKSWAPARGS",
+          "link": 50
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "WANVIDLORA",
+          "link": 89
+        },
+        {
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
           "name": "vram_management_args",
           "shape": 7,
           "type": "VRAM_MANAGEMENTARGS",
           "link": null
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
+=======
+        },
+        {
+          "name": "vace_model",
+          "shape": 7,
+          "type": "VACEPATH",
+          "link": null
+        },
+        {
+          "name": "fantasytalking_model",
+          "shape": 7,
+          "type": "FANTASYTALKINGMODEL",
+          "link": null
+        },
+        {
+          "name": "multitalk_model",
+          "shape": 7,
+          "type": "MULTITALKMODEL",
+          "link": null
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
         }
       ],
       "outputs": [
         {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
           "label": "model",
+=======
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
           "name": "model",
           "type": "WANVIDEOMODEL",
           "slot_index": 0,
@@ -1074,6 +1668,7 @@
         }
       ],
       "properties": {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
         "Node name for S&R": "WanVideoModelLoader",
         "cnr_id": "ComfyUI-WanVideoWrapper",
         "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50"
@@ -1084,11 +1679,24 @@
         "fp8_e4m3fn",
         "offload_device",
         "sageattn"
+=======
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoModelLoader"
+      },
+      "widgets_values": [
+        "WanVideo\\Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
+        "fp16",
+        "fp8_e4m3fn",
+        "offload_device",
+        "sdpa"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "color": "#223",
       "bgcolor": "#335"
     },
     {
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "id": 35,
       "type": "WanVideoTorchCompileSettings",
       "pos": [
@@ -1098,11 +1706,218 @@
       "size": [
         390.5999755859375,
         178
+=======
+      "id": 69,
+      "type": "WanVideoLoraSelect",
+      "pos": [
+        -558.93408203125,
+        -405.2188415527344
+      ],
+      "size": [
+        583.5029907226562,
+        176
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_lora",
+          "shape": 7,
+          "type": "WANVIDLORA",
+          "link": null
+        },
+        {
+          "name": "blocks",
+          "shape": 7,
+          "type": "SELECTEDBLOCKS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "lora",
+          "type": "WANVIDLORA",
+          "links": [
+            89
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "6b9565ed6307168c45770ec08517d7df65b61e3f",
+        "Node name for S&R": "WanVideoLoraSelect"
+      },
+      "widgets_values": [
+        "WanVideo\\Lightx2v\\lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+        1,
+        false,
+        "<details><summary><b>Metadata</b></summary><table border='0' cellpadding='3'><tr><td colspan='2'><b>Metadata</b></td></tr><tr><td>No metadata found</td></tr></table></details>"
+      ]
+    },
+    {
+      "id": 27,
+      "type": "WanVideoSampler",
+      "pos": [
+        1315.2401123046875,
+        -401.48028564453125
+      ],
+      "size": [
+        315,
+        927
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WANVIDEOMODEL",
+          "link": 29
+        },
+        {
+          "name": "image_embeds",
+          "type": "WANVIDIMAGE_EMBEDS",
+          "link": 66
+        },
+        {
+          "name": "text_embeds",
+          "shape": 7,
+          "type": "WANVIDEOTEXTEMBEDS",
+          "link": 30
+        },
+        {
+          "name": "samples",
+          "shape": 7,
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "feta_args",
+          "shape": 7,
+          "type": "FETAARGS",
+          "link": null
+        },
+        {
+          "name": "context_options",
+          "shape": 7,
+          "type": "WANVIDCONTEXT",
+          "link": null
+        },
+        {
+          "name": "cache_args",
+          "shape": 7,
+          "type": "CACHEARGS",
+          "link": null
+        },
+        {
+          "name": "flowedit_args",
+          "shape": 7,
+          "type": "FLOWEDITARGS",
+          "link": null
+        },
+        {
+          "name": "slg_args",
+          "shape": 7,
+          "type": "SLGARGS",
+          "link": null
+        },
+        {
+          "name": "loop_args",
+          "shape": 7,
+          "type": "LOOPARGS",
+          "link": null
+        },
+        {
+          "name": "experimental_args",
+          "shape": 7,
+          "type": "EXPERIMENTALARGS",
+          "link": null
+        },
+        {
+          "name": "sigmas",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": null
+        },
+        {
+          "name": "unianimate_poses",
+          "shape": 7,
+          "type": "UNIANIMATE_POSE",
+          "link": null
+        },
+        {
+          "name": "fantasytalking_embeds",
+          "shape": 7,
+          "type": "FANTASYTALKING_EMBEDS",
+          "link": null
+        },
+        {
+          "name": "uni3c_embeds",
+          "shape": 7,
+          "type": "UNI3C_EMBEDS",
+          "link": null
+        },
+        {
+          "name": "multitalk_embeds",
+          "shape": 7,
+          "type": "MULTITALK_EMBEDS",
+          "link": null
+        },
+        {
+          "name": "freeinit_args",
+          "shape": 7,
+          "type": "FREEINITARGS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            33
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-WanVideoWrapper",
+        "ver": "d9b1f4d1a5aea91d101ae97a54714a5861af3f50",
+        "Node name for S&R": "WanVideoSampler"
+      },
+      "widgets_values": [
+        4,
+        1,
+        5,
+        1057359483639287,
+        "fixed",
+        true,
+        "dpm++_sde",
+        0,
+        1,
+        "",
+        "comfy",
+        ""
+      ]
+    },
+    {
+      "id": 42,
+      "type": "Note",
+      "pos": [
+        -580,
+        -760
+      ],
+      "size": [
+        325.1150207519531,
+        196.76773071289062
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 12,
       "mode": 0,
       "inputs": [],
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "outputs": [
         {
           "label": "torch_compile_args",
@@ -1140,11 +1955,32 @@
       "size": [
         315,
         178
+=======
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "Adjust the blocks to swap based on your VRAM, this is a tradeoff between speed and memory usage.\n\nAlternatively there's option to use VRAM management introduced in DiffSynt-Studios. This is usually slower, but saves even more VRAM compared to BlockSwap\n\nFurther VRAM savings are from torch.compile or alternatively using the chunked rope option in the WanVideoSampler -node"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 44,
+      "type": "Note",
+      "pos": [
+        -620.9041137695312,
+        -1049.732421875
+      ],
+      "size": [
+        303.0501403808594,
+        88
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ],
       "flags": {},
       "order": 13,
       "mode": 0,
       "inputs": [],
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       "outputs": [
         {
           "label": "teacache_args",
@@ -1168,6 +2004,15 @@
         "true",
         "e"
       ]
+=======
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "If you have Triton installed, connect this for ~30% speed increase and reduced peak VRAM usage"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
     }
   ],
   "links": [
@@ -1192,7 +2037,7 @@
       16,
       0,
       27,
-      1,
+      2,
       "WANVIDEOTEXTEMBEDS"
     ],
     [
@@ -1220,19 +2065,60 @@
       "VAE"
     ],
     [
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       56,
       52,
       0,
       27,
       6,
       "TEACACHEARGS"
+=======
+      50,
+      39,
+      0,
+      22,
+      1,
+      "BLOCKSWAPARGS"
+    ],
+    [
+      52,
+      48,
+      0,
+      49,
+      0,
+      "CLIP"
+    ],
+    [
+      53,
+      48,
+      0,
+      50,
+      0,
+      "CLIP"
+    ],
+    [
+      54,
+      49,
+      0,
+      46,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      55,
+      50,
+      0,
+      46,
+      1,
+      "CONDITIONING"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
     ],
     [
       66,
       63,
       0,
       27,
-      2,
+      1,
       "WANVIDIMAGE_EMBEDS"
     ],
     [
@@ -1244,52 +2130,12 @@
       "CLIP_VISION"
     ],
     [
-      72,
-      58,
-      0,
-      66,
-      0,
-      "IMAGE"
-    ],
-    [
-      73,
-      66,
-      0,
-      65,
-      1,
-      "IMAGE"
-    ],
-    [
-      75,
-      66,
-      1,
-      63,
-      4,
-      "INT"
-    ],
-    [
-      76,
-      66,
-      2,
-      63,
-      5,
-      "INT"
-    ],
-    [
       79,
       22,
       0,
       16,
       1,
       "WANVIDEOMODEL"
-    ],
-    [
-      80,
-      55,
-      0,
-      27,
-      4,
-      "FETAARGS"
     ],
     [
       81,
@@ -1308,14 +2154,31 @@
       "WANVIDIMAGE_CLIPEMBEDS"
     ],
     [
-      83,
-      66,
+      84,
+      58,
+      0,
+      68,
+      0,
+      "IMAGE"
+    ],
+    [
+      85,
+      68,
+      0,
+      65,
+      1,
+      "IMAGE"
+    ],
+    [
+      86,
+      68,
       0,
       63,
       2,
       "IMAGE"
     ],
     [
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
       84,
       35,
       0,
@@ -1332,6 +2195,54 @@
       "offset": [
         1645.558711235432,
         246.82764211358085
+=======
+      87,
+      68,
+      1,
+      63,
+      8,
+      "INT"
+    ],
+    [
+      88,
+      68,
+      2,
+      63,
+      9,
+      "INT"
+    ],
+    [
+      89,
+      69,
+      0,
+      22,
+      2,
+      "WANVIDLORA"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "ComfyUI text encoding alternative",
+      "bounding": [
+        46.93235778808594,
+        518.1659545898438,
+        1210.621337890625,
+        805.9080810546875
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.672749994932602,
+      "offset": [
+        568.4491971472158,
+        889.9586829499522
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
       ]
     },
     "node_versions": {
@@ -1344,7 +2255,11 @@
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,
     "VHS_KeepIntermediate": true,
+<<<<<<< HEAD:example_workflows/wanvideo_480p_I2V_example_02.json
     "ue_links": []
+=======
+    "frontendVersion": "1.24.1"
+>>>>>>> ori/main:example_workflows/wanvideo_480p_I2V_example_03.json
   },
   "version": 0.4
 }

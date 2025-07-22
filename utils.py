@@ -2,7 +2,12 @@ import importlib.metadata
 import torch
 import logging
 from tqdm import tqdm
-from comfy.utils import ProgressBar
+import types
+from comfy.utils import ProgressBar, copy_to_param, set_attr_param
+from comfy.model_patcher import get_key_weight, string_to_seed
+from comfy.lora import calculate_weight
+from comfy.model_management import cast_to_device
+from comfy.float import stochastic_rounding
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -37,7 +42,32 @@ def get_tensor_memory(tensor):
     memory_bytes = tensor.element_size() * tensor.nelement()
     return f"{memory_bytes / (1024 * 1024):.2f} MB"
 
+def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
+    if key not in self.patches:
+        return
+
+    weight, set_func, convert_func = get_key_weight(self.model, key)
+    inplace_update = self.weight_inplace_update or inplace_update
+
+    if device_to is not None:
+        temp_weight = cast_to_device(weight, device_to, torch.float32, copy=True)
+    else:
+        temp_weight = weight.to(torch.float32, copy=True)
+    if convert_func is not None:
+        temp_weight = convert_func(temp_weight, inplace=True)
+
+    out_weight = calculate_weight(self.patches[key], temp_weight, key)
+    if set_func is None:
+        out_weight = stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
+        if inplace_update:
+            copy_to_param(self.model, key, out_weight)
+        else:
+            set_attr_param(self.model, key, out_weight)
+    else:
+        set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
+
 def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, dtype=None, base_dtype=None, state_dict=None, low_mem_load=False):
+        model.patch_weight_to_device = types.MethodType(patch_weight_to_device, model)
         to_load = []
         for n, m in model.model.named_modules():
             params = []
@@ -73,7 +103,13 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[key])
                     except:
                         continue
-                model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to)
+                if low_mem_load:
+                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to, inplace_update=True)
+                else:
+                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to)
+                    model.backup["{}.{}".format(name, param)] = None
+                    if device_to != transformer_load_device:
+                        set_module_tensor_to_device(m, param, device=transformer_load_device)
                 if low_mem_load:
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=model.model.diffusion_model.state_dict()[key])
@@ -233,3 +269,36 @@ def fourier_filter(x, scale_low=1.0, scale_high=1.5, freq_cutoff=20):
     x_filtered = x_filtered.to(dtype)
 
     return x_filtered
+
+def is_image_black(image, threshold=1e-3):
+    if image.min() < 0:
+        image = (image + 1) / 2
+    return torch.all(image < threshold).item()
+
+def add_noise_to_reference_video(image, ratio=None):
+    sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio 
+    image_noise = torch.randn_like(image) * sigma[:, None, None, None]
+    image_noise = torch.where(image==-1, torch.zeros_like(image), image_noise)
+    image = image + image_noise
+    return image
+
+def optimized_scale(positive_flat, negative_flat):
+
+    # Calculate dot production
+    dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+
+    # Squared norm of uncondition
+    squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+
+    # st_star = v_cond^T * v_uncond / ||v_uncond||^2
+    st_star = dot_product / squared_norm
+    
+    return st_star
+
+def find_closest_valid_dim(fixed_dim, var_dim, block_size):
+    for delta in range(1, 17):
+        for sign in [-1, 1]:
+            candidate = var_dim + sign * delta
+            if candidate > 0 and ((fixed_dim * candidate) // 4) % block_size == 0:
+                return candidate
+    return var_dim
