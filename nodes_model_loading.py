@@ -359,6 +359,10 @@ class WanVideoLoraSelect:
         loras_list = []
 
         strength = round(strength, 4)
+        if strength == 0.0:
+            if prev_lora is not None:
+                loras_list.extend(prev_lora)
+            return (loras_list,)
 
         try:
             lora_path = folder_paths.get_full_path("loras", lora)
@@ -455,43 +459,27 @@ class WanVideoLoraSelectMulti:
     def getlorapath(self, lora_0, strength_0, lora_1, strength_1, lora_2, strength_2, 
                 lora_3, strength_3, lora_4, strength_4, blocks={}, prev_lora=None, 
                 low_mem_load=False, merge_loras=True):
-        loras_list = []
-
-        strength_0 = round(strength_0, 4)
-        strength_1 = round(strength_1, 4)
-        strength_2 = round(strength_2, 4)
-        strength_3 = round(strength_3, 4)
-        strength_4 = round(strength_4, 4)
-        
-        if prev_lora is not None:
-            loras_list.extend(prev_lora)
-        
-        # Process each LoRA
+        loras_list = list(prev_lora) if prev_lora else []
         lora_inputs = [
-            (lora_0, strength_0), 
-            (lora_1, strength_1), 
-            (lora_2, strength_2), 
-            (lora_3, strength_3), 
+            (lora_0, strength_0),
+            (lora_1, strength_1),
+            (lora_2, strength_2),
+            (lora_3, strength_3),
             (lora_4, strength_4)
         ]
-        
         for lora_name, strength in lora_inputs:
-            # Skip if the LoRA is empty
-            if not lora_name or lora_name == "none":
+            s = round(strength, 4)
+            if not lora_name or lora_name == "none" or s == 0.0:
                 continue
-                
-            lora = {
+            loras_list.append({
                 "path": folder_paths.get_full_path("loras", lora_name),
-                "strength": strength,
+                "strength": s,
                 "name": lora_name.split(".")[0],
                 "blocks": blocks.get("selected_blocks", {}),
                 "layer_filter": blocks.get("layer_filter", ""),
                 "low_mem_load": low_mem_load,
                 "merge_loras": merge_loras,
-            }
-            
-            loras_list.append(lora)
-        
+            })
         return (loras_list,)
     
 class WanVideoVACEModelSelect:
@@ -670,6 +658,9 @@ class WanVideoSetLoRAs:
             log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
             lora_path = l["path"]
             lora_strength = l["strength"]
+            if lora_strength == 0:
+                log.warning(f"LoRA {lora_path} has strength 0, skipping...")
+                continue
             lora_sd = load_torch_file(lora_path, safe_load=True)
             if "dwpose_embedding.0.weight" in lora_sd: #unianimate
                 raise NotImplementedError("Unianimate LoRA patching is not implemented in this node.")
@@ -701,7 +692,7 @@ class WanVideoModelLoader:
                 "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "fp8_e4m3fn_fast_no_ffn", "fp8_e4m3fn_scaled"], {"default": "disabled", "tooltip": "optional quantization method"}),
+            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "fp8_e4m3fn_fast_no_ffn", "fp8_e4m3fn_scaled", "fp8_e5m2_scaled"], {"default": "disabled", "tooltip": "optional quantization method"}),
             "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
@@ -785,20 +776,21 @@ class WanVideoModelLoader:
             sd = load_gguf_checkpoint(model_path)
         
         if quantization == "disabled":
-            if "scaled_fp8" in sd:
-                quantization = "fp8_e4m3fn_scaled"
-            else:
-                for k, v in sd.items():
-                    if isinstance(v, torch.Tensor):
-                        if v.dtype == torch.float8_e4m3fn:
-                            quantization = "fp8_e4m3fn"
-                            break
-                        elif v.dtype == torch.float8_e5m2:
-                            quantization = "fp8_e5m2"
-                            break
+            for k, v in sd.items():
+                if isinstance(v, torch.Tensor):
+                    if v.dtype == torch.float8_e4m3fn:
+                        quantization = "fp8_e4m3fn"
+                        if "scaled_fp8" in sd:
+                            quantization = "fp8_e4m3fn_scaled"
+                        break
+                    elif v.dtype == torch.float8_e5m2:
+                        quantization = "fp8_e5m2"
+                        if "scaled_fp8" in sd:
+                            quantization = "fp8_e5m2_scaled"
+                        break
 
-        if "scaled_fp8" in sd and quantization != "fp8_e4m3fn_scaled":
-            raise ValueError("The model is a scaled fp8 model, please set quantization to 'fp8_e4m3fn_scaled'")
+        if "scaled_fp8" in sd and "scaled" not in quantization:
+            raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
 
         if merge_loras and "scaled" in quantization:
             raise ValueError("scaled models currently do not support merging LoRAs, please disable merging or use a non-scaled model")
@@ -1005,13 +997,11 @@ class WanVideoModelLoader:
         if not gguf:
             if "fp8_e4m3fn" in quantization:
                 dtype = torch.float8_e4m3fn
-            elif quantization == "fp8_e5m2":
+            elif "fp8_e5m2" in quantization:
                 dtype = torch.float8_e5m2
             else:
                 dtype = base_dtype
             params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add"}
-            if "scaled" in quantization:
-                params_to_keep = {"patch_embedding", "modulation","norm", "bias"}
             #if lora is not None:
             #    transformer_load_device = device
             if not lora_low_mem_load:
@@ -1041,6 +1031,9 @@ class WanVideoModelLoader:
                 log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
                 lora_path = l["path"]
                 lora_strength = l["strength"]
+                if lora_strength == 0:
+                    log.warning(f"LoRA {lora_path} has strength 0, skipping...")
+                    continue
                 lora_sd = load_torch_file(lora_path, safe_load=True)
                 if "dwpose_embedding.0.weight" in lora_sd: #unianimate
                     from .unianimate.nodes import update_transformer
@@ -1406,6 +1399,7 @@ class LoadWanVideoT5TextEncoder:
         text_encoder = {
             "model": T5_text_encoder,
             "dtype": dtype,
+            "name": model_name,
         }
         
         return (text_encoder,)
