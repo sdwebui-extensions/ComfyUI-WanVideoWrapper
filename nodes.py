@@ -2824,12 +2824,9 @@ class WanVideoDecode:
     CATEGORY = "WanVideoWrapper"
 
     def decode(self, vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
-<<<<<<< HEAD
         from .taehv import TAEHV
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
-=======
->>>>>>> ori/main
         mm.soft_empty_cache()
         video = samples.get("video", None)
         if video is not None:
@@ -2921,13 +2918,10 @@ class WanVideoEncode:
     CATEGORY = "WanVideoWrapper"
 
     def encode(self, vae, image, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, noise_aug_strength=0.0, latent_strength=1.0, mask=None):
-<<<<<<< HEAD
         from .taehv import TAEHV
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
-=======
->>>>>>> ori/main
         vae.to(device)
 
         image = image.clone()
