@@ -2,7 +2,7 @@ import importlib.metadata
 import torch
 import logging
 from tqdm import tqdm
-import types
+import types, collections
 from comfy.utils import ProgressBar, copy_to_param, set_attr_param
 from comfy.model_patcher import get_key_weight, string_to_seed
 from comfy.lora import calculate_weight
@@ -42,12 +42,15 @@ def get_tensor_memory(tensor):
     memory_bytes = tensor.element_size() * tensor.nelement()
     return f"{memory_bytes / (1024 * 1024):.2f} MB"
 
-def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
+def patch_weight_to_device(self, key, device_to=None, inplace_update=False, backup_keys=False, scale_weight=None):
     if key not in self.patches:
         return
-
+    
     weight, set_func, convert_func = get_key_weight(self.model, key)
     inplace_update = self.weight_inplace_update or inplace_update
+
+    if backup_keys and key not in self.backup:
+        self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
 
     if device_to is not None:
         temp_weight = cast_to_device(weight, device_to, torch.float32, copy=True)
@@ -56,7 +59,11 @@ def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
     if convert_func is not None:
         temp_weight = convert_func(temp_weight, inplace=True)
 
+    if scale_weight is not None:
+        temp_weight = temp_weight * scale_weight.to(temp_weight.device, temp_weight.dtype)
+
     out_weight = calculate_weight(self.patches[key], temp_weight, key)
+    
     if set_func is None:
         out_weight = stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
         if inplace_update:
@@ -66,7 +73,7 @@ def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
     else:
         set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
-def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, dtype=None, base_dtype=None, state_dict=None, low_mem_load=False):
+def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, dtype=None, base_dtype=None, state_dict=None, low_mem_load=False, control_lora=False, scale_weights={}):
         model.patch_weight_to_device = types.MethodType(patch_weight_to_device, model)
         to_load = []
         for n, m in model.model.named_modules():
@@ -96,18 +103,18 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                     dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
                     if "patch_embedding" in name:
                         dtype_to_use = torch.float32
-                    if name.startswith("diffusion_model."):
-                        name_no_prefix = name[len("diffusion_model."):]
-                    key = "{}.{}".format(name_no_prefix, param)
+                    key = f"{name.replace('diffusion_model.', '')}.{param}"
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[key])
                     except:
                         continue
+                key = f"{name}.{param}"
+                if scale_weights is not None:
+                    scale_key = key.replace("weight", "scale_weight").replace("diffusion_model.", "") if "weight" in key else None
                 if low_mem_load:
-                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to, inplace_update=True)
+                    model.patch_weight_to_device(f"{name}.{param}", device_to=device_to, inplace_update=True, backup_keys=control_lora, scale_weight=scale_weights.get(scale_key, None))
                 else:
-                    model.patch_weight_to_device("{}.{}".format(name, param), device_to=device_to)
-                    model.backup["{}.{}".format(name, param)] = None
+                    model.patch_weight_to_device(f"{name}.{param}", device_to=device_to, backup_keys=control_lora, scale_weight=scale_weights.get(scale_key, None))
                     if device_to != transformer_load_device:
                         set_module_tensor_to_device(m, param, device=transformer_load_device)
                 if low_mem_load:
@@ -302,3 +309,88 @@ def find_closest_valid_dim(fixed_dim, var_dim, block_size):
             if candidate > 0 and ((fixed_dim * candidate) // 4) % block_size == 0:
                 return candidate
     return var_dim
+
+ # Radial attention setup
+def setup_radial_attention(transformer, transformer_options, latent, seq_len, latent_video_length, context_options=None):
+    if context_options is not None:
+        context_frames =  (context_options["context_frames"] - 1) // 4 + 1
+
+    dense_timesteps = transformer_options.get("dense_timesteps", 1)
+    dense_blocks = transformer_options.get("dense_blocks", 1)
+    dense_vace_blocks = transformer_options.get("dense_vace_blocks", 1)
+    decay_factor = transformer_options.get("decay_factor", 0.2)
+    dense_attention_mode = transformer_options.get("dense_attention_mode", "sageattn")
+    block_size = transformer_options.get("block_size", 128)
+
+    # Calculate closest valid latent sizes
+    if latent.shape[2] % (block_size/8) != 0 or latent.shape[3] % (block_size/8) != 0:
+        block_div = int(block_size // 8)
+        closest_h = round(latent.shape[2] / block_div) * block_div
+        closest_w = round(latent.shape[3] / block_div) * block_div
+        raise Exception(
+            f"Radial attention mode only supports image size divisible by block size. "
+            f"Got {latent.shape[3] * 8}x{latent.shape[2] * 8} with block size {block_size}.\n"
+            f"Closest valid sizes: {closest_w * 8}x{closest_h * 8} (width x height in pixels)."
+        )
+    tokens_per_frame = (latent.shape[2] * latent.shape[3]) // 4
+    if tokens_per_frame % block_size != 0:
+        closest_latent_h = find_closest_valid_dim(latent.shape[3], latent.shape[2], block_size)
+        closest_latent_w = find_closest_valid_dim(latent.shape[2], latent.shape[3], block_size)
+        raise Exception(
+            f"Radial attention mode requires tokens per frame ((latent_h * latent_w) // 4) to be divisible by block size ({block_size}).\n"
+            f"Current size in latent space:{latent.shape[3]}x{latent.shape[2]}, pixel space: {latent.shape[3]*8}x{latent.shape[2]*8} tokens_per_frame={tokens_per_frame}.\n"
+            f"Try adjusting to one of these latent sizes (in pixels):\n"
+            f"  Height: {latent.shape[2]*8} -> {closest_latent_h * 8}\n"
+            f"  Width: {latent.shape[3]*8} -> {closest_latent_w * 8}\n"
+            f"Or choose another resolution so that (latent_h * latent_w) // 4 is divisible by {block_size}."
+        )
+
+    from .wanvideo.radial_attention.attn_mask import MaskMap
+    for i, block in enumerate(transformer.blocks):
+        block.self_attn.mask_map = block.dense_attention_mode = block.dense_timesteps = block.self_attn.decay_factor = None
+        if isinstance(dense_blocks, list):
+            block.dense_block = i in dense_blocks
+        else:
+            block.dense_block = i < dense_blocks
+        block.self_attn.mask_map = MaskMap(video_token_num=seq_len, num_frame=latent_video_length if context_options is None else context_frames, block_size=block_size)
+        block.dense_attention_mode = dense_attention_mode
+        block.dense_timesteps = dense_timesteps
+        block.self_attn.decay_factor = decay_factor
+    if transformer.vace_layers is not None:
+        for i, block in enumerate(transformer.vace_blocks):
+            block.self_attn.mask_map = block.dense_attention_mode = block.dense_timesteps = block.self_attn.decay_factor = None
+            if isinstance(dense_vace_blocks, list):
+                block.dense_block = i in dense_vace_blocks
+            else:
+                block.dense_block = i < dense_vace_blocks
+            block.self_attn.mask_map = MaskMap(video_token_num=seq_len, num_frame=latent_video_length if context_options is None else context_frames, block_size=block_size)
+            block.dense_attention_mode = dense_attention_mode
+            block.dense_timesteps = dense_timesteps
+            block.self_attn.decay_factor = decay_factor
+                    
+    log.info(f"Radial attention mode enabled.")
+    log.info(f"dense_attention_mode: {dense_attention_mode}, dense_timesteps: {dense_timesteps}, decay_factor: {decay_factor}")
+    log.info(f"dense_blocks: {[i for i, block in enumerate(transformer.blocks) if getattr(block, 'dense_block', False)]})")
+
+def compile_model(transformer, compile_args=None):
+    if compile_args is None:
+        return transformer
+    torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+    try:
+        if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
+            torch._dynamo.config.recompile_limit = compile_args["dynamo_recompile_limit"]
+    except Exception as e:
+        log.warning(f"Could not set recompile_limit: {e}")
+    if compile_args["compile_transformer_blocks_only"]:
+        for i, block in enumerate(transformer.blocks):
+            if hasattr(block, "_orig_mod"):
+                block = block._orig_mod
+            transformer.blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+        if transformer.vace_layers is not None:
+            for i, block in enumerate(transformer.vace_blocks):
+                if hasattr(block, "_orig_mod"):
+                    block = block._orig_mod
+                transformer.vace_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+    else:
+        transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
+    return transformer
