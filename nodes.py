@@ -5,9 +5,7 @@ import numpy as np
 from tqdm import tqdm
 import inspect
 import hashlib
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
-from .wanvideo.modules.model import rope_params
 from .fp8_optimization import convert_linear_with_lora_and_scale, remove_lora_from_module
 from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
 from .gguf.gguf import set_lora_params
@@ -15,7 +13,6 @@ from .multitalk.multitalk import timestep_transform, add_noise
 from .utils import log, print_memory, apply_lora, clip_encode_image_tiled, fourier_filter, is_image_black, add_noise_to_reference_video, optimized_scale, setup_radial_attention, compile_model
 from .cache_methods.cache_methods import cache_report
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
-from .taehv import TAEHV
 
 from einops import rearrange
 
@@ -1297,14 +1294,8 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
-        from .wanvideo.modules.model import rope_params
-        from .wanvideo.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
-        from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-        from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
+        from .enhance_a_video.globals import set_enhance_weight, set_num_frames
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
-        from .taehv import TAEHV
-        from .wanvideo.utils.scheduling_flow_match_lcm import FlowMatchLCMScheduler
-        from .wanvideo.utils.basic_flowmatch import FlowMatchScheduler
 
         dtype = model["dtype"]
         gguf = model["gguf"]
