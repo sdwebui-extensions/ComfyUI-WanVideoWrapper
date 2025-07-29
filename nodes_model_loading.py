@@ -1138,7 +1138,7 @@ class WanVideoModelLoader:
 
 
         if "fast" in quantization:
-            if not merge_loras:
+            if not merge_loras and lora is not None:
                 raise ValueError("FP8 fast quantization requires LoRAs to be merged into the model, please set merge_loras=True in the LoRA input")
             from .fp8_optimization import convert_fp8_linear
             if quantization == "fp8_e4m3fn_fast_no_ffn":

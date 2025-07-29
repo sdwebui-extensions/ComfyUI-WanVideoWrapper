@@ -20,6 +20,7 @@ from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
+from .wanvideo.modules.model import rope_params
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 

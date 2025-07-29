@@ -32,11 +32,12 @@ try:
 except Exception as e:
     try:
         from sageattention import sageattn
-        def sageattn_func(q, k, v, attn_mask=None, dropout_p=0, is_causal=False):
+        @torch.compiler.disable()
+        def sageattn_func(q, k, v, attn_mask=None, dropout_p=0, is_causal=False, tensor_layout="HND"):
             if q.dtype == torch.float32:
-                return sageattn(q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal).to(torch.float32)
+                return sageattn(q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, tensor_layout=tensor_layout).to(torch.float32)
             else:
-                return sageattn(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+                return sageattn(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, tensor_layout=tensor_layout)
     except:
         print(f"Warning: Could not load sageattention: {str(e)}")
         if isinstance(e, ModuleNotFoundError):
