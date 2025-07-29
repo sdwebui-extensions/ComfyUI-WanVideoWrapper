@@ -1546,9 +1546,7 @@ class WanModel(ModelMixin, ConfigMixin):
         else:
             expanded_timesteps = False
 
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(x.dtype)
-        )  # b, dim
+        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(x.dtype))  # b, dim
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))  # b, 6, dim
 
         if fps_embeds is not None:

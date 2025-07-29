@@ -501,3 +501,13 @@ def compile_model(transformer, compile_args=None):
         transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
     return transformer
 
+def tangential_projection(pred_cond: torch.Tensor, pred_uncond: torch.Tensor) -> torch.Tensor:
+    cond_dtype = pred_cond.dtype
+    preds = torch.stack([pred_cond, pred_uncond], dim=1).float()
+    orig_shape = preds.shape[2:]
+    preds_flat = preds.flatten(2)
+    U, S, Vh = torch.linalg.svd(preds_flat, full_matrices=False)
+    Vh_modified = Vh.clone()
+    Vh_modified[:, 1] = 0
+    recon = U @ torch.diag_embed(S) @ Vh_modified
+    return recon[:, 1].view(pred_uncond.shape).to(cond_dtype)

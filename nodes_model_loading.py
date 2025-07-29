@@ -9,7 +9,7 @@ from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 
 from accelerate import init_empty_weights
-from accelerate.utils import set_module_tensor_to_device
+from .utils import set_module_tensor_to_device
 
 from .fp8_optimization import convert_linear_with_lora_and_scale
 
@@ -54,7 +54,7 @@ class WanVideoModel(comfy.model_base.BaseModel):
         self.pipeline[k] = v
 
 try:
-    from comfy.latent_formats import Wan21
+    from comfy.latent_formats import Wan21, Wan22
     latent_format = Wan21
 except: #for backwards compatibility
     log.warning("Wan21 latent format not found, update ComfyUI for better livepreview")
@@ -62,11 +62,11 @@ except: #for backwards compatibility
     latent_format = HunyuanVideo
 
 class WanVideoModelConfig:
-    def __init__(self, dtype):
+    def __init__(self, dtype, latent_format=latent_format):
         self.unet_config = {}
         self.unet_extra_config = {}
         self.latent_format = latent_format
-        self.latent_format.latent_channels = 16
+        #self.latent_format.latent_channels = 16
         self.manual_cast_dtype = dtype
         self.sampling_settings = {"multiplier": 1.0}
         self.memory_usage_factor = 2.0
@@ -849,14 +849,27 @@ class WanVideoModelLoader:
         elif "model_type.Wan2_1-FLF2V-14B-720P" in sd or "img_emb.emb_pos" in sd or "flf2v" in model.lower():
             model_type = "fl2v"
         elif in_channels in [36, 48]:
-            model_type = "i2v"
+            if "blocks.0.cross_attn.k_img.weight" not in sd:
+                model_type = "t2v"
+            else:
+                model_type = "i2v"
         elif in_channels == 16:
             model_type = "t2v"
         elif "control_adapter.conv.weight" in sd:
             model_type = "t2v"
 
-        num_heads = 40 if dim == 5120 else 12
-        num_layers = 40 if dim == 5120 else 30
+        out_dim = 16
+        if dim == 5120: #14B
+            num_heads = 40
+            num_layers = 40
+        elif dim == 3072: #5B
+            num_heads = 24
+            num_layers = 30
+            out_dim = 48
+            model_type = "t2v" #5B no img crossattn
+        else: #1.3B
+            num_heads = 12
+            num_layers = 30
 
         vace_layers, vace_in_dim = None, None
         if "vace_blocks.0.after_proj.weight" in sd:
@@ -908,6 +921,8 @@ class WanVideoModelLoader:
             
         if dim == 1536:
             model_variant = "1_3B"
+        if dim == 3072:
+            log.info(f"5B model detected, no Teacache or MagCache coefficients available, consider using EasyCache for this model")
         log.info(f"Model variant detected: {model_variant}")
         
         TRANSFORMER_CONFIG= {
@@ -920,7 +935,7 @@ class WanVideoModelLoader:
             "freq_dim": 256,
             "in_dim": in_channels,
             "model_type": model_type,
-            "out_dim": 16,
+            "out_dim": out_dim,
             "text_len": 512,
             "num_heads": num_heads,
             "num_layers": num_layers,
@@ -1002,8 +1017,9 @@ class WanVideoModelLoader:
             transformer.add_proj = zero_module(torch.nn.Linear(inner_dim, inner_dim))
             transformer.attn_conv_in = torch.nn.Conv3d(attn_cond_in_dim, inner_dim, kernel_size=transformer.patch_size, stride=transformer.patch_size)
         
+        latent_format=Wan22 if dim == 3072 else Wan21
         comfy_model = WanVideoModel(
-            WanVideoModelConfig(base_dtype),
+            WanVideoModelConfig(base_dtype, latent_format=latent_format),
             model_type=comfy.model_base.ModelType.FLOW,
             device=device,
         )
@@ -1300,7 +1316,7 @@ class WanVideoVAELoader:
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
     def loadmodel(self, model_name, precision):
-        from .wanvideo.wan_video_vae import WanVideoVAE
+        from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         #with open(os.path.join(script_directory, 'configs', 'hy_vae_config.json')) as f:
@@ -1311,8 +1327,12 @@ class WanVideoVAELoader:
         has_model_prefix = any(k.startswith("model.") for k in vae_sd.keys())
         if not has_model_prefix:
             vae_sd = {f"model.{k}": v for k, v in vae_sd.items()}
-        
-        vae = WanVideoVAE(dtype=dtype)
+
+        if vae_sd["model.conv2.weight"].shape[0] == 16:
+            vae = WanVideoVAE(dtype=dtype)
+        elif vae_sd["model.conv2.weight"].shape[0] == 48:
+            vae = WanVideoVAE38(dtype=dtype)
+
         vae.load_state_dict(vae_sd)
         vae.eval()
         vae.to(device = offload_device, dtype = dtype)
